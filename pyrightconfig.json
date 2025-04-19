@@ -1,0 +1,21 @@
+{
+    "include": [
+        "cyclonev2",
+        "dashboard",
+        "data_collection",
+        "database",
+        "feature_engineering",
+        "modeling",
+        "orchestration",
+        "sentiment_analysis",
+        "trading"
+    ],
+    "executionEnvironments": [
+        {
+            "root": ".",
+            "pythonVersion": "3.12",
+            "pythonPlatform": "Linux"
+        }
+    ],
+    "typeCheckingMode": "basic"
+}
