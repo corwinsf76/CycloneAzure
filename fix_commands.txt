@@ -1,0 +1,19 @@
+# COPY AND RUN THESE COMMANDS ONE BY ONE:
+
+# 1. Remove the existing remote completely
+git remote remove origin
+
+# 2. Verify the remote was removed
+git remote -v
+
+# 3. Add the correct remote URL (exactly as provided by Azure DevOps)
+git remote add origin https://justinlaughlin@dev.azure.com/justinlaughlin/cyclonev2/_git/cyclonev2
+
+# 4. Verify the new remote is correctly set
+git remote -v
+
+# 5. Push your code to Azure DevOps
+git push -u origin main
+
+# These commands MUST be executed exactly as shown.
+# When prompted for password, use your Personal Access Token (PAT), not your regular password.

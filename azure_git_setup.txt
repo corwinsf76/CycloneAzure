@@ -1,0 +1,20 @@
+# COMPLETE MANUAL GIT COMMANDS FOR AZURE DEVOPS SETUP
+
+# 1. First, check your current remote configuration
+git remote -v
+
+# 2. Completely remove the existing remote connection
+git remote remove origin
+
+# 3. Add the correct remote URL for your Azure DevOps repository
+git remote add origin https://justinlaughlin@dev.azure.com/justinlaughlin/cyclonev2/_git/cyclonev2
+
+# 4. Verify that the new remote is correctly set
+git remote -v
+
+# 5. Push your code to Azure DevOps
+git push -u origin main
+
+# When prompted for credentials:
+# Username: justinlaughlin
+# Password: Your Personal Access Token (PAT)

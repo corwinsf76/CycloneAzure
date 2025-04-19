@@ -1,0 +1,28 @@
+# DIRECT COMMANDS TO FIX NESTED REPOSITORY ISSUE
+
+# 1. First, check for nested .git directories
+find . -name ".git" -type d
+
+# 2. Remove cyclonev22 from git tracking (if it exists)
+git rm --cached cyclonev22
+
+# 3. Remove the .git directory inside cyclonev22 (if it exists)
+rm -rf cyclonev22/.git
+
+# 4. Add cyclonev22 as regular files
+git add cyclonev22
+
+# 5. Commit the changes
+git commit -m "Convert cyclonev22 from submodule to regular directory"
+
+# 6. Push to Azure DevOps
+git push origin main
+
+# 7. Check for .gitmodules file and remove if present
+rm -f .gitmodules
+git add .gitmodules
+git commit -m "Remove submodules configuration"
+git push origin main
+
+# 8. After running these commands, restart VS Code or your editor
+# to refresh the source control view

@@ -1,0 +1,23 @@
+# MANUAL GIT COMMANDS TO FIX AZURE DEVOPS REMOTE
+
+# 1. First, completely remove the existing remote connection
+#    This command deletes the "origin" remote entirely
+git remote remove origin
+
+# 2. Verify that the remote has been removed
+#    This command should show nothing if the remote was successfully removed
+git remote -v
+
+# 3. Add the correct remote URL for your Azure DevOps repository
+git remote add origin https://justinlaughlin@dev.azure.com/justinlaughlin/cyclonev2/_git/cyclonev2
+
+# 4. Verify that the new remote is correctly set
+#    This should show the new URL you just added
+git remote -v
+
+# 5. Push your code to Azure DevOps
+#    This pushes your main branch to the repository
+git push -u origin main
+
+# When prompted for your password, use your Personal Access Token (PAT)
+# not your regular password.
