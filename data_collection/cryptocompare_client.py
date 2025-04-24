@@ -1,111 +1,131 @@
 import os
-import requests
 import logging
 from typing import Dict, Any, Optional
+import aiohttp
+import asyncio
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+import config
+from database.db_utils import async_bulk_insert
 
 # Setup logging
 log = logging.getLogger(__name__)
 
-# Load API key from environment variables
+# Load API key
 API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY")
 BASE_URL = "https://min-api.cryptocompare.com/data"
 
 if not API_KEY:
     log.error("CryptoCompare API key is not set. Please add it to your .env file.")
 
-
-def fetch_price_data(symbol: str, currency: str = "USD") -> Optional[Dict[str, Any]]:
-    """
-    Fetches real-time price data for a given cryptocurrency symbol.
-
-    Args:
-        symbol (str): The cryptocurrency symbol (e.g., BTC, ETH).
-        currency (str): The fiat currency to convert to (default is USD).
-
-    Returns:
-        Optional[Dict[str, Any]]: The price data or None if the request fails.
-    """
-    endpoint = f"{BASE_URL}/price"
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+async def fetch_price_data(symbol: str, currency: str = "USD") -> Optional[Dict[str, Any]]:
+    """Fetch real-time price data from CryptoCompare."""
+    url = f"{BASE_URL}/price"
     params = {
-        "fsym": symbol,
-        "tsyms": currency,
-        "api_key": API_KEY
+        'fsym': symbol,
+        'tsyms': currency,
+        'api_key': API_KEY
     }
+
     try:
-        response = requests.get(endpoint, params=params)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if currency in data:
+                        price_data = {
+                            'symbol': symbol,
+                            'currency': currency,
+                            'price': data[currency],
+                            'timestamp': 'now'  # CryptoCompare will use server time
+                        }
+                        
+                        # Store in database
+                        await async_bulk_insert([price_data], 'cryptocompare_prices')
+                        return price_data
+                        
+                return None
+                
+    except Exception as e:
         log.error(f"Failed to fetch price data for {symbol}: {e}")
         return None
 
-
-def fetch_historical_data(symbol: str, currency: str = "USD", limit: int = 30) -> Optional[Dict[str, Any]]:
-    """
-    Fetches historical price data for a given cryptocurrency symbol.
-
-    Args:
-        symbol (str): The cryptocurrency symbol (e.g., BTC, ETH).
-        currency (str): The fiat currency to convert to (default is USD).
-        limit (int): The number of historical data points to fetch (default is 30).
-
-    Returns:
-        Optional[Dict[str, Any]]: The historical price data or None if the request fails.
-    """
-    endpoint = f"{BASE_URL}/v2/histoday"
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+async def fetch_historical_data(symbol: str, currency: str = "USD", limit: int = 30) -> Optional[Dict[str, Any]]:
+    """Fetch historical price data from CryptoCompare."""
+    url = f"{BASE_URL}/histoday"
     params = {
-        "fsym": symbol,
-        "tsym": currency,
-        "limit": limit,
-        "api_key": API_KEY
+        'fsym': symbol,
+        'tsym': currency,
+        'limit': limit,
+        'api_key': API_KEY
     }
+
     try:
-        response = requests.get(endpoint, params=params)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if 'Data' in data:
+                        history = data['Data']
+                        processed_data = [{
+                            'symbol': symbol,
+                            'currency': currency,
+                            'timestamp': day['time'],
+                            'open': day['open'],
+                            'high': day['high'],
+                            'low': day['low'],
+                            'close': day['close'],
+                            'volume': day['volumefrom']
+                        } for day in history]
+                        
+                        # Store in database
+                        await async_bulk_insert(processed_data, 'cryptocompare_historical')
+                        return {'symbol': symbol, 'data': history}
+                        
+                return None
+                
+    except Exception as e:
         log.error(f"Failed to fetch historical data for {symbol}: {e}")
         return None
 
-
-def fetch_social_data(symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetches social sentiment data for a given cryptocurrency symbol.
-
-    Args:
-        symbol (str): The cryptocurrency symbol (e.g., BTC, ETH).
-
-    Returns:
-        Optional[Dict[str, Any]]: The social sentiment data or None if the request fails.
-    """
-    endpoint = f"{BASE_URL}/social/coin/latest"
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+async def fetch_social_data(symbol: str) -> Optional[Dict[str, Any]]:
+    """Fetch social media stats from CryptoCompare."""
+    url = f"{BASE_URL}/social/coin/latest"
     params = {
-        "coinId": symbol,
-        "api_key": API_KEY
+        'coinId': symbol,
+        'api_key': API_KEY
     }
+
     try:
-        response = requests.get(endpoint, params=params)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if 'Data' in data:
+                        social_stats = data['Data']
+                        processed_data = {
+                            'symbol': symbol,
+                            'reddit_subscribers': social_stats.get('Reddit', {}).get('subscribers', 0),
+                            'reddit_active_users': social_stats.get('Reddit', {}).get('active_users', 0),
+                            'twitter_followers': social_stats.get('Twitter', {}).get('followers', 0),
+                            'twitter_statuses': social_stats.get('Twitter', {}).get('statuses', 0),
+                            'github_forks': social_stats.get('Github', {}).get('forks', 0),
+                            'github_stars': social_stats.get('Github', {}).get('stars', 0),
+                            'timestamp': 'now'
+                        }
+                        
+                        # Store in database
+                        await async_bulk_insert([processed_data], 'cryptocompare_social')
+                        return processed_data
+                        
+                return None
+                
+    except Exception as e:
         log.error(f"Failed to fetch social data for {symbol}: {e}")
         return None
-
-# Example usage
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
-    # Fetch real-time price data
-    price_data = fetch_price_data("BTC")
-    if price_data:
-        log.info(f"Real-time price data: {price_data}")
-
-    # Fetch historical price data
-    historical_data = fetch_historical_data("BTC")
-    if historical_data:
-        log.info(f"Historical price data: {historical_data}")
-
-    # Fetch social sentiment data
-    social_data = fetch_social_data("BTC")
-    if social_data:
-        log.info(f"Social sentiment data: {social_data}")

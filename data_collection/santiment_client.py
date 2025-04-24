@@ -1,45 +1,37 @@
 import os
-import requests
 import logging
 from typing import Dict, Any, Optional
+import aiohttp
+import asyncio
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+import config
+from database.db_utils import async_bulk_insert
 
 # Setup logging
 log = logging.getLogger(__name__)
 
-# Load API key from environment variables
+# Load API key
 API_KEY = os.getenv("SANTIMENT_API_KEY")
 BASE_URL = "https://api.santiment.net/graphql"
 
 if not API_KEY:
     log.error("Santiment API key is not set. Please add it to your .env file.")
 
-
-def fetch_social_volume(slug: str, from_date: str, to_date: str, interval: str = "1d") -> Optional[Dict[str, Any]]:
-    """
-    Fetches social volume data for a given cryptocurrency slug.
-
-    Args:
-        slug (str): The cryptocurrency slug (e.g., "ethereum", "bitcoin").
-        from_date (str): Start date in ISO 8601 format (e.g., "2023-01-01T00:00:00Z").
-        to_date (str): End date in ISO 8601 format (e.g., "2023-01-05T00:00:00Z").
-        interval (str): Data interval (e.g., "1d" for daily).
-
-    Returns:
-        Optional[Dict[str, Any]]: The social volume data or None if the request fails.
-    """
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+async def fetch_social_volume(slug: str, from_date: str, to_date: str, interval: str = "1d") -> Optional[Dict[str, Any]]:
+    """Fetch social volume data from Santiment API."""
     query = {
         "query": f"""
         {{
-            getMetric(metric: "social_volume_total") {{
-                timeseriesData(
-                    slug: "{slug}",
-                    from: "{from_date}",
-                    to: "{to_date}",
-                    interval: "{interval}"
-                ) {{
-                    datetime
-                    value
-                }}
+            socialVolume(
+                slug: "{slug}",
+                from: "{from_date}",
+                to: "{to_date}",
+                interval: "{interval}"
+            ) {{
+                datetime
+                value
             }}
         }}
         """
@@ -47,40 +39,43 @@ def fetch_social_volume(slug: str, from_date: str, to_date: str, interval: str =
     headers = {"Authorization": f"Apikey {API_KEY}"}
 
     try:
-        response = requests.post(BASE_URL, json=query, headers=headers)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(BASE_URL, json=query, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    social_volume = data.get('data', {}).get('socialVolume', [])
+                    
+                    # Process and store data
+                    if social_volume:
+                        processed_data = [{
+                            'slug': slug,
+                            'datetime': item['datetime'],
+                            'value': item['value']
+                        } for item in social_volume]
+                        
+                        await async_bulk_insert(processed_data, 'santiment_social_volume')
+                        return {'slug': slug, 'data': social_volume}
+                    
+                return None
+                
+    except Exception as e:
         log.error(f"Failed to fetch social volume data for {slug}: {e}")
         return None
 
-
-def fetch_active_addresses(slug: str, from_date: str, to_date: str, interval: str = "1d") -> Optional[Dict[str, Any]]:
-    """
-    Fetches active addresses data for a given cryptocurrency slug.
-
-    Args:
-        slug (str): The cryptocurrency slug (e.g., "ethereum", "bitcoin").
-        from_date (str): Start date in ISO 8601 format (e.g., "2023-01-01T00:00:00Z").
-        to_date (str): End date in ISO 8601 format (e.g., "2023-01-05T00:00:00Z").
-        interval (str): Data interval (e.g., "1d" for daily).
-
-    Returns:
-        Optional[Dict[str, Any]]: The active addresses data or None if the request fails.
-    """
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+async def fetch_active_addresses(slug: str, from_date: str, to_date: str, interval: str = "1d") -> Optional[Dict[str, Any]]:
+    """Fetch active addresses data from Santiment API."""
     query = {
         "query": f"""
         {{
-            getMetric(metric: "active_addresses_24h") {{
-                timeseriesData(
-                    slug: "{slug}",
-                    from: "{from_date}",
-                    to: "{to_date}",
-                    interval: "{interval}"
-                ) {{
-                    datetime
-                    value
-                }}
+            dailyActiveAddresses(
+                slug: "{slug}",
+                from: "{from_date}",
+                to: "{to_date}",
+                interval: "{interval}"
+            ) {{
+                datetime
+                activeAddresses
             }}
         }}
         """
@@ -88,23 +83,25 @@ def fetch_active_addresses(slug: str, from_date: str, to_date: str, interval: st
     headers = {"Authorization": f"Apikey {API_KEY}"}
 
     try:
-        response = requests.post(BASE_URL, json=query, headers=headers)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(BASE_URL, json=query, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    active_addresses = data.get('data', {}).get('dailyActiveAddresses', [])
+                    
+                    # Process and store data
+                    if active_addresses:
+                        processed_data = [{
+                            'slug': slug,
+                            'datetime': item['datetime'],
+                            'active_addresses': item['activeAddresses']
+                        } for item in active_addresses]
+                        
+                        await async_bulk_insert(processed_data, 'santiment_active_addresses')
+                        return {'slug': slug, 'data': active_addresses}
+                    
+                return None
+                
+    except Exception as e:
         log.error(f"Failed to fetch active addresses data for {slug}: {e}")
         return None
-
-# Example usage
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
-    # Fetch social volume data
-    social_volume = fetch_social_volume("ethereum", "2023-01-01T00:00:00Z", "2023-01-05T00:00:00Z")
-    if social_volume:
-        log.info(f"Social volume data: {social_volume}")
-
-    # Fetch active addresses data
-    active_addresses = fetch_active_addresses("ethereum", "2023-01-01T00:00:00Z", "2023-01-05T00:00:00Z")
-    if active_addresses:
-        log.info(f"Active addresses data: {active_addresses}")

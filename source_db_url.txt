@@ -1,0 +1,1 @@
+mssql+pyodbc://justinlaughlin:Thomas12@cyclonev2master.database.windows.net:1433/cyclonev2database?driver=ODBC+Driver+18+for+SQL+Server&Encrypt=yes&TrustServerCertificate=no&Connection+Timeout=30

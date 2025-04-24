@@ -1,488 +1,605 @@
-# /dashboard/callbacks.py
+"""
+Dashboard callbacks module with async support
 
+This module defines the callback functions for the dashboard application,
+including configuration management, trading control, and data visualization.
+"""
+
+from typing import List, Dict, Any
 import logging
-import sys
-import os
-from dash import Dash, dcc, html, Input, Output, State, callback, dash_table
-from dash.exceptions import PreventUpdate # <--- Correct import location
+import json
+import asyncio
+import pandas as pd
+from dash import Input, Output, State, ctx, callback, no_update, ALL
+from dash.exceptions import PreventUpdate
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import dash_bootstrap_components as dbc
-import pandas as pd
-import numpy as np
-import datetime
-import pytz
-from database import db_utils  # Import database utilities for shared state management
+from dash import html, dash_table
 
-# Add the project root directory to PYTHONPATH dynamically
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(project_root)
+from .data_provider import (
+    get_price_data,
+    get_sentiment_data,
+    get_market_metrics,
+    get_technical_indicators,
+    get_social_metrics,
+    get_sentiment_history,
+    get_low_value_coins,
+    get_portfolio_holdings
+)
+from .config_manager import config_manager
+from trading.portfolio import Portfolio
 
-# Use absolute imports assuming 'cyclonev2' is the project root added to PYTHONPATH
-import config # To potentially update config values (use with caution)
-from dashboard import data_provider # To fetch data
-from trading import trader # To re-enable symbols
-# from .. import config
-# from . import data_provider
-# from ..trading import trader
-
-# Initialize database connection
-engine = db_utils.engine
 log = logging.getLogger(__name__)
 
-# --- Helper Function for Shared State ---
-def update_shared_state(key, value):
-    """Update shared state in the database."""
-    try:
-        db_utils.set_config_value(key, value)  # Replace with the correct function from db_utils
-        log.info(f"Shared state updated: {key} = {value}")
-        return True
-    except Exception as e:
-        log.error(f"Failed to update shared state: {e}", exc_info=True)
-        return False
-
-# --- Register Callbacks ---
-# Note: Callbacks need the 'app' instance, which is created in app.py.
-# We define functions here and register them in app.py to avoid circular imports.
-
-def register_callbacks(app: Dash):
-    """Registers all callbacks for the Dash application."""
-    log.info("Registering dashboard callbacks...")
-
-    # --- Interval Update Callback ---
+def register_callbacks(app):
     @app.callback(
-        [
-            # Overview Tab Outputs
-            Output('overview-status-indicators', 'children'),
-            Output('overview-total-value', 'children'),
-            Output('overview-cash', 'children'),
-            Output('overview-open-positions', 'children'),
-            Output('overview-pnl-graph', 'figure'),
-            Output('overview-trade-table', 'data'),
-            Output('overview-trade-table', 'columns'),
-            Output('overview-alerts', 'children'),
-            # Trading Tab Outputs
-            Output('trading-open-positions-table', 'data'),
-            Output('trading-open-positions-table', 'columns'),
-            Output('trading-history-table', 'data'),
-            Output('trading-history-table', 'columns'),
-            # Settings Tab Outputs (Update disabled symbols dropdown)
-            Output('settings-disabled-symbol-dropdown', 'options'),
-            # Market Tab Outputs (Update symbol list dynamically?)
-            # Output('market-symbol-dropdown', 'options'), # Optional: Refresh symbol list
-        ],
-        [Input('interval-component', 'n_intervals')]
+        Output('price-chart', 'figure'),
+        Output('sentiment-gauge', 'figure'),
+        Output('sentiment-timeline', 'figure'),
+        Output('market-metrics', 'children'),
+        Output('technical-indicators', 'children'),
+        Output('social-metrics', 'children'),
+        Input('update-interval', 'n_intervals'),
+        State('symbol-selector', 'value')
     )
-    def update_dashboard_on_interval(n):
-        """Periodic update triggered by the interval timer."""
-        log.debug(f"Dashboard refresh triggered by interval {n}")
+    def update_dashboard(n_intervals: int, symbol: str):
+        """
+        Main dashboard update callback - converted from async to sync
+        Uses asyncio.run() to execute async data fetching
+        """
+        if not symbol:
+            raise PreventUpdate
 
-        # Fetch data using data_provider functions
-        overview_data = data_provider.get_overview_data()
-        open_pos_df, history_df = data_provider.get_trading_data()
-        perf_df = data_provider.get_performance_data() # For PnL graph
-
-        # --- Process Overview Data ---
-        status_indicators = [
-            html.P(f"Trading Halted: {'YES' if overview_data.get('halt_status') else 'NO'}",
-                   style={'color': 'red' if overview_data.get('halt_status') else 'green'}),
-            # TODO: Add status for Model, Data Feeds etc.
-        ]
-        total_value_str = f"${overview_data.get('total_value', 0):,.2f}"
-        cash_str = f"${overview_data.get('cash', 0):,.2f}"
-        open_pos_count_str = str(overview_data.get('open_positions_count', 0))
-        alerts_children = [html.P("Disabled Symbols: " + ", ".join(overview_data.get('disabled_symbols', [])))]
-        # TODO: Add other system alerts
-
-        # PnL Graph
-        pnl_fig = go.Figure()
-        if not perf_df.empty:
-            pnl_fig.add_trace(go.Scatter(x=perf_df.index, y=perf_df['cumulative_pnl'], mode='lines', name='Cumulative PnL'))
-            pnl_fig.update_layout(title="Cumulative Realized PnL Over Time", xaxis_title="Time", yaxis_title="PnL (USD)")
-        else:
-            pnl_fig = create_empty_figure("No PnL data available")
-
-        # Recent Trades Table
-        trade_cols = [{"name": i, "id": i} for i in overview_data.get('latest_trades', pd.DataFrame()).columns]
-        trade_data = overview_data.get('latest_trades', pd.DataFrame()).to_dict('records')
-
-        # --- Process Trading Data ---
-        open_pos_cols = [{"name": i, "id": i} for i in open_pos_df.columns]
-        open_pos_data = open_pos_df.to_dict('records')
-        history_cols = [{"name": i, "id": i} for i in history_df.columns]
-        history_data = history_df.to_dict('records')
-
-        # --- Process Settings Data ---
-        disabled_symbols_options = [{'label': s, 'value': s} for s in overview_data.get('disabled_symbols', [])]
-
-        return (
-            status_indicators, total_value_str, cash_str, open_pos_count_str, pnl_fig,
-            trade_data, trade_cols, alerts_children,
-            open_pos_data, open_pos_cols, history_data, history_cols,
-            disabled_symbols_options
-        )
-
-    # --- Market View Callbacks ---
-    @app.callback(
-        Output('market-price-chart', 'figure'),
-        [Input('market-symbol-dropdown', 'value'),
-         Input('market-timeframe-dropdown', 'value')]
-    )
-    def update_market_chart(selected_symbol, selected_timeframe):
-        """Updates the price chart based on selected symbol and timeframe."""
-        if not selected_symbol or not selected_timeframe:
-            raise PreventUpdate # Or return empty figure
-
-        log.debug(f"Updating market chart for {selected_symbol}, timeframe {selected_timeframe}")
-        market_df = data_provider.get_market_data(selected_symbol, selected_timeframe)
-
-        if market_df.empty:
-            return create_empty_figure(f"No market data found for {selected_symbol}")
-
-        # Create Candlestick chart
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                           vertical_spacing=0.05, row_heights=[0.7, 0.3])
-
-        fig.add_trace(go.Candlestick(x=market_df.index,
-                        open=market_df['open'], high=market_df['high'],
-                        low=market_df['low'], close=market_df['close'],
-                        name='Price'), row=1, col=1)
-
-        # Add Volume bars
-        fig.add_trace(go.Bar(x=market_df.index, y=market_df['volume'], name='Volume'), row=2, col=1)
-
-        # Add Technical Indicators (example for SMA)
-        if 'sma_fast' in market_df.columns:
-             fig.add_trace(go.Scatter(x=market_df.index, y=market_df['sma_fast'], mode='lines', name='SMA Fast', line=dict(width=1)), row=1, col=1)
-        if 'sma_slow' in market_df.columns:
-             fig.add_trace(go.Scatter(x=market_df.index, y=market_df['sma_slow'], mode='lines', name='SMA Slow', line=dict(width=1)), row=1, col=1)
-        # Add other indicators (EMA, RSI, MACD) similarly, potentially on separate subplots if needed
-
-        fig.update_layout(
-            title=f'{selected_symbol} Price Chart ({selected_timeframe})',
-            xaxis_title="Time",
-            yaxis_title="Price (USD)",
-            xaxis_rangeslider_visible=False, # Hide range slider
-            legend_title="Indicators"
-        )
-        fig.update_yaxes(title_text="Volume", row=2, col=1)
-
-        return fig
-
-    # --- Market Insights Callbacks ---
-    @app.callback(
-        [
-            Output('cryptopanic-sentiment-graph', 'figure'),
-            Output('cryptopanic-stats', 'children'),
-            Output('alphavantage-health-graph', 'figure'),
-            Output('alphavantage-stats', 'children'),
-            Output('coingecko-metrics-graph', 'figure'),
-            Output('coingecko-stats', 'children')
-        ],
-        [Input('interval-component', 'n_intervals')]
-    )
-    def update_market_insights(_):
-        """Updates all market insights graphs and statistics."""
         try:
-            # Fetch recent data from database
-            with engine.connect() as conn:
-                # CryptoPanic sentiment data
-                sentiment_query = """
-                    SELECT symbol, sentiment_score, bullish_count, bearish_count, timestamp
-                    FROM cryptopanic_sentiment
-                    WHERE timestamp >= NOW() - INTERVAL '24 hours'
-                    ORDER BY timestamp
-                """
-                sentiment_df = pd.read_sql(sentiment_query, conn)
-                
-                # AlphaVantage health data
-                health_query = """
-                    SELECT symbol, health_score, rsi, macd, macd_signal, timestamp
-                    FROM alphavantage_health
-                    WHERE timestamp >= NOW() - INTERVAL '24 hours'
-                    ORDER BY timestamp
-                """
-                health_df = pd.read_sql(health_query, conn)
-                
-                # CoinGecko metrics data
-                metrics_query = """
-                    SELECT symbol, market_cap, total_volume, price_change_24h,
-                        market_cap_rank, community_score, timestamp
-                    FROM coingecko_metrics
-                    WHERE timestamp >= NOW() - INTERVAL '24 hours'
-                    ORDER BY timestamp
-                """
-                metrics_df = pd.read_sql(metrics_query, conn)
+            # Define async function to fetch all data concurrently
+            async def fetch_all_data():
+                price_df_task = get_price_data(symbol)
+                sentiment_data_task = get_sentiment_data(symbol)
+                sentiment_history_task = get_sentiment_history(symbol, hours=72)
+                market_data_task = get_market_metrics(symbol)
+                technical_data_task = get_technical_indicators(symbol)
+                social_data_task = get_social_metrics(symbol)
 
-            # Create CryptoPanic sentiment visualization
-            sentiment_fig = go.Figure()
-            if not sentiment_df.empty:
-                for symbol in sentiment_df['symbol'].unique():
-                    symbol_data = sentiment_df[sentiment_df['symbol'] == symbol]
-                    sentiment_fig.add_trace(go.Scatter(
-                        x=symbol_data['timestamp'],
-                        y=symbol_data['sentiment_score'],
-                        name=f"{symbol} Sentiment",
-                        mode='lines'
-                    ))
-                sentiment_fig.update_layout(
-                    title="Market Sentiment Trends",
-                    xaxis_title="Time",
-                    yaxis_title="Sentiment Score"
+                return await asyncio.gather(
+                    price_df_task,
+                    sentiment_data_task,
+                    sentiment_history_task,
+                    market_data_task,
+                    technical_data_task,
+                    social_data_task
                 )
-                
-                # Calculate sentiment stats
-                sentiment_stats = html.Div([
-                    html.P(f"Average Sentiment: {sentiment_df['sentiment_score'].mean():.2f}"),
-                    html.P(f"Bullish/Bearish Ratio: {sentiment_df['bullish_count'].sum() / max(sentiment_df['bearish_count'].sum(), 1):.2f}")
-                ])
-            else:
-                sentiment_stats = html.P("No sentiment data available")
 
-            # Create AlphaVantage health visualization
-            health_fig = go.Figure()
-            if not health_df.empty:
-                for symbol in health_df['symbol'].unique():
-                    symbol_data = health_df[health_df['symbol'] == symbol]
-                    health_fig.add_trace(go.Scatter(
-                        x=symbol_data['timestamp'],
-                        y=symbol_data['health_score'],
-                        name=f"{symbol} Health",
-                        mode='lines'
-                    ))
-                health_fig.update_layout(
-                    title="Market Health Trends",
-                    xaxis_title="Time",
-                    yaxis_title="Health Score"
+            # Execute async function synchronously
+            price_df, sentiment_data, sentiment_history_df, market_data, technical_data, social_data = asyncio.run(fetch_all_data())
+
+            # Create price chart
+            price_fig = go.Figure(data=[
+                go.Candlestick(
+                    x=price_df['open_time'],
+                    open=price_df['open'],
+                    high=price_df['high'],
+                    low=price_df['low'],
+                    close=price_df['close']
                 )
-                
-                # Calculate health stats
-                health_stats = html.Div([
-                    html.P(f"Average Health Score: {health_df['health_score'].mean():.2f}"),
-                    html.P(f"Average RSI: {health_df['rsi'].mean():.2f}")
-                ])
-            else:
-                health_stats = html.P("No health data available")
+            ])
+            price_fig.update_layout(
+                title=f'{symbol} Price Action',
+                yaxis_title='Price',
+                template='plotly_dark'
+            )
 
-            # Create CoinGecko metrics visualization
-            metrics_fig = go.Figure()
-            if not metrics_df.empty:
-                # Market Cap vs Volume Plot
-                metrics_fig = make_subplots(specs=[[{"secondary_y": True}]])
+            # Create sentiment gauge
+            sentiment_fig = create_sentiment_gauge(sentiment_data)
+
+            # Create sentiment timeline chart
+            sentiment_timeline_fig = create_sentiment_timeline_chart(sentiment_history_df, symbol)
+
+            # Create market metrics card
+            market_card = create_market_metrics_card(market_data)
+
+            # Create technical indicators card
+            technical_card = create_technical_card(technical_data)
+
+            # Create social metrics card
+            social_card = create_social_metrics_card(social_data)
+
+            return price_fig, sentiment_fig, sentiment_timeline_fig, market_card, technical_card, social_card
+
+        except Exception as e:
+            log.error(f"Error updating dashboard for {symbol}: {e}")
+            return go.Figure(), go.Figure(), go.Figure(), [], [], []
+
+    @app.callback(
+        Output('social-feed', 'children'),
+        Input('status-update-interval', 'n_intervals'),
+        State('symbol-selector', 'value')
+    )
+    def update_social_feed(n_intervals: int, symbol: str):
+        """
+        Update social media feed - converted from async to sync
+        """
+        if not symbol:
+            raise PreventUpdate
+            
+        try:
+            # Execute async function synchronously
+            sentiment_data = asyncio.run(get_sentiment_data(symbol))
+            
+            if not sentiment_data or not sentiment_data.get('raw_data'):
+                return "No social data available"
                 
-                for symbol in metrics_df['symbol'].unique():
-                    symbol_data = metrics_df[metrics_df['symbol'] == symbol]
-                    # Market Cap on primary y-axis
-                    metrics_fig.add_trace(
-                        go.Scatter(
-                            x=symbol_data['timestamp'],
-                            y=symbol_data['market_cap'],
-                            name=f"{symbol} Market Cap",
-                            mode='lines'
-                        ),
-                        secondary_y=False
-                    )
-                    # Volume on secondary y-axis
-                    metrics_fig.add_trace(
-                        go.Scatter(
-                            x=symbol_data['timestamp'],
-                            y=symbol_data['total_volume'],
-                            name=f"{symbol} Volume",
-                            mode='lines'
-                        ),
-                        secondary_y=True
-                    )
-                
-                metrics_fig.update_layout(
-                    title="Market Cap vs Volume",
-                    xaxis_title="Time"
+            feed_items = []
+            
+            # Process news items
+            for item in sentiment_data['raw_data'].get('news', []):
+                feed_items.append(
+                    create_news_card(item)
                 )
-                metrics_fig.update_yaxes(title_text="Market Cap", secondary_y=False)
-                metrics_fig.update_yaxes(title_text="Volume", secondary_y=True)
+            
+            # Process social items
+            for item in sentiment_data['raw_data'].get('social', []):
+                feed_items.append(
+                    create_social_card(item)
+                )
+            
+            return feed_items
+            
+        except Exception as e:
+            log.error(f"Error updating social feed: {e}")
+            raise PreventUpdate
+
+    @app.callback(
+        Output('trading-status-store', 'data'),
+        Output('trading-status-badge', 'children'),
+        Output('trading-status-badge', 'className'),
+        Output('trading-enabled-switch', 'value'),
+        Output('trading-mode-select', 'value'),
+        Input('status-update-interval', 'n_intervals')
+    )
+    def update_trading_status(n_intervals):
+        """
+        Periodically fetch and update the trading status - converted from async to sync
+        """
+        try:
+            # Execute async function synchronously
+            status = asyncio.run(config_manager.get_trading_status())
+            
+            trading_enabled = status.get('trading_enabled', False)
+            test_mode = status.get('test_mode', True)
+            
+            if trading_enabled:
+                if test_mode:
+                    badge_text = "PAPER TRADING ACTIVE"
+                    badge_class = "badge bg-warning text-dark me-2"
+                else:
+                    badge_text = "LIVE TRADING ACTIVE"
+                    badge_class = "badge bg-success me-2"
+            else:
+                badge_text = "TRADING DISABLED"
+                badge_class = "badge bg-secondary me-2"
+            
+            switch_value = trading_enabled
+            mode_value = "paper" if test_mode else "live"
+            
+            return status, badge_text, badge_class, switch_value, mode_value
+            
+        except Exception as e:
+            log.error(f"Error updating trading status: {e}")
+            return {}, "STATUS ERROR", "badge bg-danger me-2", False, "paper"
+
+    @app.callback(
+        Output('low-value-watchlist-content', 'children'),
+        Input('update-interval', 'n_intervals')
+    )
+    def update_low_value_watchlist(n_intervals):
+        """
+        Fetch and display the low-value coin watchlist. - converted to sync
+        """
+        try:
+            # Execute async function synchronously
+            low_value_coins = asyncio.run(get_low_value_coins())
+            if not low_value_coins:
+                return html.P("No low-value coins found matching the criteria.", className="text-muted")
+
+            return create_low_value_table(low_value_coins)
+
+        except Exception as e:
+            log.error(f"Error updating low-value watchlist: {e}")
+            return html.P("Error loading low-value coin data.", className="text-danger")
+
+    @app.callback(
+        Output('portfolio-summary-content', 'children'),
+        Output('positions-table-container', 'children'),
+        Input('trading-status-store', 'data'),
+        Input('tabs', 'active_tab')
+    )
+    async def update_portfolio_summary(status_data, active_tab):
+        """
+        Update portfolio summary and holdings table.
+        Fetches holdings directly from the database.
+        """
+        if active_tab != "tab-trading-control":
+            return no_update, no_update
+
+        try:
+            holdings_df = await get_portfolio_holdings()
+
+            balance = status_data.get('balance', 0) if status_data else 0
+            position_count = len(holdings_df)
+            trading_enabled = status_data.get('trading_enabled', False) if status_data else False
+
+            summary_content = [
+                html.Div([
+                    html.Div([
+                        html.H6("Portfolio Balance"),
+                        html.H3(f"${balance:,.2f}", className="text-primary")
+                    ], className="col-md-4"),
+
+                    html.Div([
+                        html.H6("Open Positions"),
+                        html.H3(f"{position_count}", className="text-info")
+                    ], className="col-md-4"),
+
+                    html.Div([
+                        html.H6("Trading Status"),
+                        html.H3([
+                            html.Span(
+                                "ACTIVE" if trading_enabled else "INACTIVE",
+                                className=f"badge {'bg-success' if trading_enabled else 'bg-secondary'}"
+                            )
+                        ])
+                    ], className="col-md-4"),
+                ], className="row text-center")
+            ]
+
+            if holdings_df.empty:
+                positions_table = html.P("No active positions", className="text-muted")
+            else:
+                positions_table = dash_table.DataTable(
+                    id='positions-table',
+                    columns=[
+                        {'name': col, 'id': col} for col in holdings_df.columns
+                    ],
+                    data=holdings_df.to_dict('records'),
+                    style_header={
+                        'backgroundColor': 'rgb(30, 30, 30)',
+                        'color': 'white'
+                    },
+                    style_cell={
+                        'backgroundColor': 'rgb(50, 50, 50)',
+                        'color': 'white',
+                        'textAlign': 'left'
+                    },
+                    style_as_list_view=True,
+                    page_size=10,
+                )
+
+            return summary_content, positions_table
+
+        except Exception as e:
+            log.error(f"Error updating portfolio summary: {e}")
+            error_message = html.Div([
+                html.P(f"Error loading portfolio data: {str(e)}", className="text-danger")
+            ])
+            return error_message, html.Div()
+
+    @app.callback(
+        Output('settings-toast', 'is_open'),
+        Input('save-settings-btn', 'n_clicks'),
+        State({'type': 'config-input', 'id': ALL}, 'id'),
+        State({'type': 'config-input', 'id': ALL}, 'value'),
+        prevent_initial_call=True
+    )
+    async def save_configuration_settings(n_clicks, input_ids, input_values):
+        """
+        Save all modified configuration parameters
+        """
+        if not n_clicks:
+            return False
+            
+        try:
+            for input_id, value in zip(input_ids, input_values):
+                param_key = input_id['id']
+                await config_manager.set_config_value(param_key, value)
                 
-                # Calculate market metrics stats
-                metrics_stats = html.Div([
-                    html.P(f"Total Market Cap: ${metrics_df['market_cap'].sum():,.0f}"),
-                    html.P(f"24h Price Change: {metrics_df['price_change_24h'].mean():.2f}%"),
-                    html.P(f"Average Community Score: {metrics_df['community_score'].mean():.2f}")
-                ])
-            else:
-                metrics_stats = html.P("No market metrics available")
-
-            return sentiment_fig, sentiment_stats, health_fig, health_stats, metrics_fig, metrics_stats
-
+            log.info(f"Saved {len(input_ids)} configuration parameters")
+            return True
+            
         except Exception as e:
-            log.error(f"Error updating market insights: {e}")
-            empty_fig = go.Figure()
-            error_message = html.P(f"Error loading data: {str(e)}")
-            return empty_fig, error_message, empty_fig, error_message, empty_fig, error_message
-
-    # --- Sentiment Tab Callbacks ---
-    @app.callback(
-        Output('sentiment-agg-chart', 'figure'),
-        [Input('sentiment-timeframe-dropdown', 'value')]
-    )
-    def update_sentiment_chart(selected_timeframe):
-        """Updates the aggregated sentiment chart."""
-        log.debug(f"Updating sentiment chart for timeframe {selected_timeframe}")
-        sentiment_df = data_provider.get_sentiment_data(selected_timeframe)
-
-        if sentiment_df.empty:
-            return create_empty_figure("No sentiment data found")
-
-        # Example: Resample to hourly average sentiment
-        # Ensure index is datetime before resampling
-        if not pd.api.types.is_datetime64_any_dtype(sentiment_df.index):
-             sentiment_df.index = pd.to_datetime(sentiment_df.index, utc=True)
-
-        sentiment_resampled = sentiment_df['sentiment_score'].resample('1H').mean() # Hourly average
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=sentiment_resampled.index, y=sentiment_resampled, mode='lines', name='Avg Sentiment Score (Hourly)'))
-        fig.update_layout(title=f"Average Sentiment Score ({selected_timeframe})", xaxis_title="Time", yaxis_title="Avg Score")
-
-        return fig
-
-
-    # --- Settings Tab Callbacks ---
-    # WARNING: Modifying config module directly at runtime from a web app is generally
-    # not recommended, especially in multi-process deployments (like gunicorn).
-    # Changes might not persist or affect the running trader process reliably.
-    # A better approach involves a dedicated config management system, database flags,
-    # or inter-process communication (e.g., Redis, message queue).
-    # These callbacks are provided as a basic example but use with extreme caution.
+            log.error(f"Error saving configuration: {e}")
+            return False
 
     @app.callback(
-        Output('settings-update-capital-pct-status', 'children'),
-        [Input('settings-update-capital-pct-button', 'n_clicks')],
-        [State('settings-capital-pct-input', 'value')],
+        Output('trading-status-store', 'data', allow_duplicate=True),
+        Input('apply-trading-settings-btn', 'n_clicks'),
+        State('trading-enabled-switch', 'value'),
+        State('trading-mode-select', 'value'),
         prevent_initial_call=True
     )
-    def update_capital_pct(n_clicks, value):
-        if n_clicks is None or value is None:
+    async def apply_trading_settings(n_clicks, trading_enabled, trading_mode):
+        """
+        Apply trading status settings (enabled/disabled and paper/live mode)
+        """
+        if not n_clicks:
             raise PreventUpdate
+            
         try:
-            new_value = float(value)
-            if 0.001 <= new_value <= 0.1:  # Basic validation
-                if update_shared_state('TRADE_CAPITAL_PERCENTAGE', new_value):
-                    return dbc.Alert(f"Capital % updated to {new_value:.3f}", color="success", duration=3000)
-                else:
-                    return dbc.Alert("Failed to update shared state", color="danger", duration=3000)
+            test_mode = trading_mode == "paper"
+            
+            success = await config_manager.set_trading_status(
+                enabled=trading_enabled,
+                test_mode=test_mode
+            )
+            
+            if success:
+                new_status = await config_manager.get_trading_status()
+                return new_status
             else:
-                return dbc.Alert("Invalid value (must be 0.001-0.1)", color="danger", duration=3000)
+                raise Exception("Failed to update trading status")
+                
         except Exception as e:
-            log.error(f"Error updating capital %: {e}")
-            return dbc.Alert("Update failed", color="danger", duration=3000)
-
-    @app.callback(
-        Output('settings-update-stop-loss-status', 'children'),
-        [Input('settings-update-stop-loss-button', 'n_clicks')],
-        [State('settings-stop-loss-input', 'value')],
-        prevent_initial_call=True
-    )
-    def update_stop_loss(n_clicks, value):
-        if n_clicks is None or value is None:
+            log.error(f"Error applying trading settings: {e}")
             raise PreventUpdate
-        try:
-            new_value = float(value)
-            if 0.001 <= new_value <= 0.9:  # Basic validation
-                if update_shared_state('STOP_LOSS_PCT', new_value):
-                    return dbc.Alert(f"Stop Loss % updated to {new_value:.3f}", color="success", duration=3000)
-                else:
-                    return dbc.Alert("Failed to update shared state", color="danger", duration=3000)
-            else:
-                return dbc.Alert("Invalid value", color="danger", duration=3000)
-        except Exception as e:
-            log.error(f"Error updating stop loss %: {e}")
-            return dbc.Alert("Update failed", color="danger", duration=3000)
 
     @app.callback(
-        Output('settings-update-take-profit-status', 'children'),
-        [Input('settings-update-take-profit-button', 'n_clicks')],
-        [State('settings-take-profit-input', 'value')],
+        Output('trading-status-store', 'data', allow_duplicate=True),
+        Input('sell-all-positions-btn', 'n_clicks'),
         prevent_initial_call=True
     )
-    def update_take_profit(n_clicks, value):
-        if n_clicks is None or value is None:
+    async def sell_all_positions(n_clicks):
+        """
+        Sell all currently held positions
+        """
+        if not n_clicks:
             raise PreventUpdate
+            
         try:
-            new_value = float(value)
-            if 0.001 <= new_value <= 1.0:  # Basic validation
-                if update_shared_state('TAKE_PROFIT_PCT', new_value):
-                    return dbc.Alert(f"Take Profit % updated to {new_value:.3f}", color="success", duration=3000)
-                else:
-                    return dbc.Alert("Failed to update shared state", color="danger", duration=3000)
-            else:
-                return dbc.Alert("Invalid value", color="danger", duration=3000)
+            portfolio = config_manager.portfolio
+            if not portfolio:
+                portfolio = config_manager.portfolio = Portfolio()
+                
+            positions = await portfolio.get_all_positions()
+            
+            for symbol, amount in positions.items():
+                if amount > 0:
+                    await portfolio.sell(symbol, amount)
+                    log.info(f"Sold {amount} of {symbol}")
+            
+            new_status = await config_manager.get_trading_status()
+            return new_status
+            
         except Exception as e:
-            log.error(f"Error updating take profit %: {e}")
-            return dbc.Alert("Update failed", color="danger", duration=3000)
-
-    @app.callback(
-        Output('settings-update-drawdown-status', 'children'),
-        [Input('settings-update-drawdown-button', 'n_clicks')],
-        [State('settings-drawdown-input', 'value')],
-        prevent_initial_call=True
-    )
-    def update_drawdown(n_clicks, value):
-        if n_clicks is None or value is None:
+            log.error(f"Error selling all positions: {e}")
             raise PreventUpdate
-        try:
-            new_value = float(value)
-            if 0.01 <= new_value <= 0.99:  # Basic validation
-                if update_shared_state('PORTFOLIO_DRAWDOWN_PCT', new_value):
-                    return dbc.Alert(f"Max Drawdown % updated to {new_value:.2f}", color="success", duration=3000)
-                else:
-                    return dbc.Alert("Failed to update shared state", color="danger", duration=3000)
-            else:
-                return dbc.Alert("Invalid value", color="danger", duration=3000)
-        except Exception as e:
-            log.error(f"Error updating drawdown %: {e}")
-            return dbc.Alert("Update failed", color="danger", duration=3000)
 
     @app.callback(
-        Output('settings-trading-mode-status', 'children'),
-        [Input('settings-trading-mode-switch', 'value')],
+        Output('emergency-stop-modal', 'is_open'),
+        Input('emergency-stop-btn', 'n_clicks'),
+        Input('emergency-shutdown-btn', 'n_clicks'),
+        Input('emergency-stop-cancel', 'n_clicks'),
+        Input('emergency-stop-confirm', 'n_clicks'),
+        State('emergency-stop-modal', 'is_open'),
         prevent_initial_call=True
     )
-    def update_trading_mode(live_mode_enabled):
-        # WARNING: Changing trading mode requires robust state management.
-        # This callback only updates the display and logs a warning.
-        # The actual trading_mode needs to be read by the trader logic from a reliable source (state file, DB flag).
-        mode = "LIVE" if live_mode_enabled else "PAPER"
-        log.warning(f"Dashboard switch toggled to {mode}. Actual trading mode depends on trader process reading shared state mechanism - NOT YET IMPLEMENTED)")
-        # TODO: Implement mechanism to signal trading mode change to the scheduler/trader process
-        return f"Current Mode Display: {mode} (Control requires shared state mechanism - NOT YET IMPLEMENTED)"
-
+    def toggle_emergency_modal(btn1, btn2, cancel, confirm, is_open):
+        """
+        Toggle the emergency shutdown confirmation modal
+        """
+        if btn1 or btn2:
+            return True
+        elif cancel:
+            return False
+        elif confirm:
+            return False
+        return is_open
 
     @app.callback(
-        Output('settings-reenable-symbol-status', 'children'),
-        [Input('settings-reenable-symbol-button', 'n_clicks')],
-        [State('settings-disabled-symbol-dropdown', 'value')],
+        Output('trading-status-store', 'data', allow_duplicate=True),
+        Input('emergency-stop-confirm', 'n_clicks'),
         prevent_initial_call=True
     )
-    def reenable_symbol(n_clicks, symbol_to_enable):
-        if n_clicks is None or not symbol_to_enable:
+    async def execute_emergency_shutdown(n_clicks):
+        """
+        Execute emergency shutdown when confirmed
+        """
+        if not n_clicks:
             raise PreventUpdate
+            
         try:
-            log.info(f"Dashboard request to re-enable symbol: {symbol_to_enable}")
-            trader.enable_symbol(symbol_to_enable)  # Re-enable the symbol using the trader module
-            return dbc.Alert(f"Symbol {symbol_to_enable} re-enabled.", color="success", duration=3000)
+            shutdown_result = await config_manager.emergency_shutdown()
+            
+            log.warning(f"Emergency shutdown executed: {shutdown_result}")
+            
+            status = await config_manager.get_trading_status()
+            return status
+            
         except Exception as e:
-            log.error(f"Error re-enabling symbol {symbol_to_enable}: {e}", exc_info=True)
-            return dbc.Alert(f"Failed to re-enable {symbol_to_enable}.", color="danger", duration=3000)
+            log.error(f"Error during emergency shutdown: {e}")
+            raise PreventUpdate
 
+    @app.callback(
+        Output({'type': 'config-input', 'id': ALL}, 'value'),
+        Input('reset-settings-btn', 'n_clicks'),
+        State({'type': 'config-input', 'id': ALL}, 'id'),
+        prevent_initial_call=True
+    )
+    def reset_to_defaults(n_clicks, input_ids):
+        """
+        Reset configuration parameters to default values
+        """
+        if not n_clicks:
+            raise PreventUpdate
+            
+        try:
+            default_values = {}
+            
+            current_values = []
+            for param_id in input_ids:
+                param_key = param_id['id']
+                current_values.append(config_manager.get_config_value(param_key))
+                
+            return current_values
+            
+        except Exception as e:
+            log.error(f"Error resetting to defaults: {e}")
+            raise PreventUpdate
 
-    log.info("Dashboard callbacks registered.")
+def create_sentiment_gauge(sentiment_data: Dict[str, Any]) -> go.Figure:
+    """Create a sentiment gauge chart"""
+    current_sentiment = 0.0
+    if sentiment_data and sentiment_data.get('aggregates'):
+        if 'social' in sentiment_data['aggregates'] and sentiment_data['aggregates']['social']['current'] != 0.0:
+             current_sentiment = sentiment_data['aggregates']['social']['current']
+        elif 'news' in sentiment_data['aggregates'] and sentiment_data['aggregates']['news']['current'] != 0.0:
+             current_sentiment = sentiment_data['aggregates']['news']['current']
 
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=current_sentiment,
+        title={'text': "Overall Sentiment"},
+        gauge={
+            'axis': {'range': [-1, 1]},
+            'bar': {'color': "darkblue"},
+            'steps': [
+                {'range': [-1, -0.5], 'color': "red"},
+                {'range': [-0.5, 0], 'color': "orange"},
+                {'range': [0, 0.5], 'color': "lightgreen"},
+                {'range': [0.5, 1], 'color': "green"}
+            ]
+        }
+    ))
 
-# --- Helper function used in callbacks ---
-def create_empty_figure(message="No data available") -> go.Figure:
-    """Creates an empty Plotly figure with a message."""
+    fig.update_layout(template='plotly_dark', height=250, margin=dict(t=40, b=40, l=20, r=20))
+    return fig
+
+def create_sentiment_timeline_chart(df: pd.DataFrame, symbol: str) -> go.Figure:
+    """Create a time-series chart for sentiment scores."""
     fig = go.Figure()
+    if not df.empty:
+        fig.add_trace(go.Scatter(
+            x=df['timestamp'],
+            y=df['score'],
+            mode='lines+markers',
+            name='Sentiment Score',
+            line=dict(color='cyan'),
+            marker=dict(size=4)
+        ))
+        if len(df) > 5:
+             df['rolling_avg'] = df['score'].rolling(window=5, center=True).mean()
+             fig.add_trace(go.Scatter(
+                 x=df['timestamp'],
+                 y=df['rolling_avg'],
+                 mode='lines',
+                 name='Rolling Avg (5pt)',
+                 line=dict(color='magenta', dash='dash')
+             ))
+
     fig.update_layout(
-        xaxis={'visible': False},
-        yaxis={'visible': False},
-        annotations=[{'text': message, 'xref': 'paper', 'yref': 'paper', 'showarrow': False, 'font': {'size': 16}}]
+        title=f"{symbol} Sentiment Over Time",
+        xaxis_title="Time",
+        yaxis_title="Sentiment Score",
+        yaxis_range=[-1, 1],
+        template='plotly_dark',
+        height=300,
+        margin=dict(t=40, b=40, l=40, r=20),
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
     )
     return fig
+
+def create_low_value_table(coins_data: List[Dict[str, Any]]) -> dash_table.DataTable:
+    """Create a DataTable for the low-value coin watchlist."""
+    df = pd.DataFrame(coins_data)
+    df = df.rename(columns={'symbol': 'Symbol', 'current_price': 'Price ($)', 'name': 'Name'})
+
+    return dash_table.DataTable(
+        id='low-value-table',
+        columns=[{'name': i, 'id': i} for i in df.columns],
+        data=df.to_dict('records'),
+        style_header={
+            'backgroundColor': 'rgb(30, 30, 30)',
+            'color': 'white',
+            'fontWeight': 'bold'
+        },
+        style_cell={
+            'backgroundColor': 'rgb(50, 50, 50)',
+            'color': 'white',
+            'textAlign': 'left',
+            'padding': '5px'
+        },
+        style_data_conditional=[
+            {
+                'if': {'column_id': 'Price ($)'},
+                'textAlign': 'right'
+            }
+        ],
+        style_as_list_view=True,
+        page_size=10,
+        sort_action='native',
+        filter_action='native',
+    )
+
+def create_market_metrics_card(market_data: Dict[str, Any]) -> List:
+    """Create market metrics display"""
+    if not market_data:
+        return ["No market data available"]
+        
+    return [
+        f"Market Cap: ${market_data['market_cap']:,.2f}",
+        f"24h Volume: ${market_data['volume_24h']:,.2f}",
+        f"24h Change: {market_data['price_change_24h']:.2f}%",
+        f"Market Rank: #{market_data['market_rank']}",
+        f"Community Score: {market_data['community_score']:.1f}"
+    ]
+
+def create_technical_card(technical_data: Dict[str, Any]) -> List:
+    """Create technical indicators display"""
+    if not technical_data:
+        return ["No technical data available"]
+        
+    return [
+        f"RSI (14): {technical_data['rsi']:.2f}",
+        f"MACD: {technical_data['macd']['value']:.2f}",
+        f"Signal: {technical_data['macd']['signal']:.2f}",
+        f"SMA 20: {technical_data['moving_averages']['sma_20']:.2f}",
+        f"SMA 50: {technical_data['moving_averages']['sma_50']:.2f}",
+        f"SMA 200: {technical_data['moving_averages']['sma_200']:.2f}"
+    ]
+
+def create_social_metrics_card(social_data: Dict[str, Any]) -> List:
+    """Create social metrics display"""
+    if not social_data:
+        return ["No social data available"]
+        
+    twitter_data = social_data.get('twitter', {})
+    reddit_data = social_data.get('reddit', {})
+    
+    return [
+        "Twitter Metrics:",
+        f"Posts: {twitter_data.get('post_count', 0)}",
+        f"Engagement: {twitter_data.get('total_engagement', 0)}",
+        f"Sentiment: {twitter_data.get('avg_sentiment', 0):.2f}",
+        "Reddit Metrics:",
+        f"Posts: {reddit_data.get('post_count', 0)}",
+        f"Comments: {reddit_data.get('total_comments', 0)}",
+        f"Score: {reddit_data.get('total_score', 0)}",
+        f"Sentiment: {reddit_data.get('avg_sentiment', 0):.2f}"
+    ]
+
+def create_news_card(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a news item card"""
+    return {
+        'type': 'news',
+        'timestamp': item['timestamp'],
+        'score': item['score'],
+        'source': item['source']
+    }
+
+def create_social_card(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a social media item card"""
+    return {
+        'type': 'social',
+        'timestamp': item['timestamp'],
+        'score': item['score'],
+        'platform': item['platform']
+    }

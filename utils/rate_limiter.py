@@ -1,53 +1,49 @@
 """
-Utilities for API rate limiting and asynchronous operation.
+Async Rate Limiter Utility
+
+This module provides an async-compatible rate limiter to help respect API rate limits.
 """
 
-import time
 import asyncio
+import time
+from collections import deque
 import logging
+from typing import Deque, Optional
 
 log = logging.getLogger(__name__)
 
-class RateLimiter:
-    """Synchronous rate limiter to control API call frequency."""
-    def __init__(self, calls_per_minute: int):
-        if calls_per_minute <= 0:
-            raise ValueError("calls_per_minute must be positive")
-        self.calls_per_minute = calls_per_minute
-        self.interval = 60.0 / calls_per_minute
-        self.last_call_time = 0
-
-    def wait_if_needed(self):
-        """Waits if the time since the last call is less than the allowed interval."""
-        now = time.monotonic() # Use monotonic clock for interval measurement
-        time_since_last_call = now - self.last_call_time
-
-        if time_since_last_call < self.interval:
-            wait_time = self.interval - time_since_last_call
-            log.debug(f"Rate limiting: waiting for {wait_time:.2f} seconds")
-            time.sleep(wait_time)
-            self.last_call_time = time.monotonic() # Update after waiting
-        else:
-            self.last_call_time = now # Update immediately if no wait needed
-
 class AsyncRateLimiter:
-    """Asynchronous rate limiter to control API call frequency without blocking the event loop."""
     def __init__(self, calls_per_minute: int):
-        if calls_per_minute <= 0:
-            raise ValueError("calls_per_minute must be positive")
-        self.calls_per_minute = calls_per_minute
-        self.interval = 60.0 / calls_per_minute
-        self.last_call_time = 0
+        """Initialize rate limiter with calls per minute limit."""
+        self.calls_per_minute = max(1, calls_per_minute)
+        self.time_between_calls = 60.0 / self.calls_per_minute
+        self.call_times: Deque[float] = deque(maxlen=calls_per_minute)
+        self._lock = asyncio.Lock()
 
-    async def wait_if_needed(self):
-        """Asynchronously waits if the time since the last call is less than the allowed interval."""
-        now = time.monotonic() # Use monotonic clock for interval measurement
-        time_since_last_call = now - self.last_call_time
+    async def wait_if_needed(self) -> None:
+        """Wait if necessary to respect the rate limit."""
+        async with self._lock:
+            current_time = time.monotonic()
+            
+            # Remove old timestamps
+            while self.call_times and current_time - self.call_times[0] > 60:
+                self.call_times.popleft()
+            
+            if len(self.call_times) >= self.calls_per_minute:
+                # Calculate required wait time
+                wait_time = 60 - (current_time - self.call_times[0])
+                if wait_time > 0:
+                    log.debug(f"Rate limit reached. Waiting {wait_time:.2f} seconds...")
+                    await asyncio.sleep(wait_time)
+            
+            # Add current call time
+            self.call_times.append(time.monotonic())
 
-        if time_since_last_call < self.interval:
-            wait_time = self.interval - time_since_last_call
-            log.debug(f"Async rate limiting: waiting for {wait_time:.2f} seconds")
-            await asyncio.sleep(wait_time)
-            self.last_call_time = time.monotonic() # Update after waiting
-        else:
-            self.last_call_time = now # Update immediately if no wait needed
+    async def __aenter__(self):
+        """Context manager support."""
+        await self.wait_if_needed()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Context manager cleanup."""
+        pass

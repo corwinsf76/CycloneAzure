@@ -1,301 +1,223 @@
-# /sentiment_analysis/cross_asset_sentiment.py
+"""
+Cross-Asset Sentiment Analysis Module - Now with async support
+
+This module analyzes sentiment relationships between different crypto assets
+and provides insights into market-wide sentiment patterns.
+"""
 
 import logging
-import pandas as pd
+from typing import Dict, List, Optional, Any
 import numpy as np
-import datetime
+import pandas as pd
+from datetime import datetime, timedelta
 import pytz
-from datetime import timedelta
-from typing import Dict, List, Tuple, Optional, Set
 import asyncio
 
-from database import db_utils
-from utils.rate_limiter import AsyncRateLimiter
 import config
-from sentiment_analysis.advanced_sentiment import fetch_sentiment_data, fetch_price_data
+from database.db_utils import async_df_to_db, async_bulk_insert
+from .analyzer import analyze_texts_batch, get_aggregate_sentiment
 
 log = logging.getLogger(__name__)
 
-# Base cryptocurrencies that influence the market
-BASE_INFLUENCE_SYMBOLS = ['BTC', 'ETH']
+async def analyze_cross_asset_sentiment(
+    symbols: List[str],
+    lookback_days: int = 7
+) -> Optional[Dict[str, Any]]:
+    """
+    Analyze sentiment relationships between different assets over time.
+    Returns correlation matrix and other cross-asset metrics.
+    """
+    if not symbols:
+        return None
+    
+    try:
+        end_date = datetime.now(pytz.UTC)
+        start_date = end_date - timedelta(days=lookback_days)
+        
+        # Get sentiment data for each symbol
+        sentiments = {}
+        for symbol in symbols:
+            symbol_sentiment = await get_symbol_sentiment_history(
+                symbol,
+                start_date,
+                end_date
+            )
+            if symbol_sentiment is not None:
+                sentiments[symbol] = symbol_sentiment
+        
+        if not sentiments:
+            return None
+        
+        # Create DataFrame with sentiment scores
+        df = pd.DataFrame(sentiments)
+        
+        # Calculate correlation matrix
+        corr_matrix = df.corr()
+        
+        # Find highly correlated pairs
+        correlated_pairs = []
+        for i in range(len(symbols)):
+            for j in range(i + 1, len(symbols)):
+                sym1, sym2 = symbols[i], symbols[j]
+                if sym1 in corr_matrix.index and sym2 in corr_matrix.columns:
+                    corr = corr_matrix.loc[sym1, sym2]
+                    if abs(corr) > 0.7:  # High correlation threshold
+                        correlated_pairs.append({
+                            'symbol1': sym1,
+                            'symbol2': sym2,
+                            'correlation': float(corr)
+                        })
+        
+        # Calculate market-wide sentiment metrics
+        market_sentiment = {
+            'avg_sentiment': float(df.mean().mean()),
+            'sentiment_volatility': float(df.std().mean()),
+            'sentiment_dispersion': float(df.std(axis=1).mean()),
+            'timestamp': datetime.now(pytz.UTC)
+        }
+        
+        # Store results
+        results = {
+            'correlation_matrix': corr_matrix.to_dict(),
+            'correlated_pairs': correlated_pairs,
+            'market_sentiment': market_sentiment,
+            'timestamp': datetime.now(pytz.UTC)
+        }
+        
+        await async_bulk_insert([results], 'cross_asset_sentiment')
+        return results
+        
+    except Exception as e:
+        log.error(f"Error in cross-asset sentiment analysis: {e}")
+        return None
 
-# Cache for spillover effects
-_spillover_cache: Dict[str, Dict[str, Tuple[float, datetime.datetime]]] = {}
-
-async def calculate_sentiment_spillover(
-    base_symbol: str,
-    target_symbol: str,
-    lookback_days: int = 30
-) -> float:
-    """
-    Calculate how sentiment from a major crypto spills over to a target crypto.
-    
-    Args:
-        base_symbol: The base symbol (e.g., 'BTC')
-        target_symbol: The target symbol to analyze spillover (e.g., 'SOL')
-        lookback_days: Number of days to look back for analysis
-        
-    Returns:
-        Spillover coefficient (correlation between base sentiment and target price changes)
-    """
-    engine = db_utils.engine
-    if not engine:
-        log.error("Database engine not available")
-        return 0.0
-    
-    # Clean symbols
-    base_symbol = base_symbol.replace('USDT', '')
-    target_symbol = target_symbol.replace('USDT', '')
-    
-    # Skip if base and target are the same
-    if base_symbol == target_symbol:
-        return 0.0
-        
-    end_time = datetime.datetime.now(pytz.UTC)
-    start_time = end_time - timedelta(days=lookback_days)
-    
-    # Fetch sentiment data for base and price data for target
-    base_sentiment = await fetch_sentiment_data(engine, base_symbol, start_time, end_time)
-    target_price = await fetch_price_data(engine, f"{target_symbol}USDT", config.CANDLE_INTERVAL, start_time, end_time)
-    
-    if base_sentiment.empty or target_price.empty:
-        log.warning(f"Insufficient data for sentiment spillover analysis: {base_symbol} -> {target_symbol}")
-        return 0.0
-    
-    # Resample sentiment data to match price data frequency
-    price_freq = pd.infer_freq(target_price.index)
-    if price_freq:
-        base_sentiment_resampled = base_sentiment.resample(price_freq).mean()
-    else:
-        # If frequency can't be inferred, use the original data
-        base_sentiment_resampled = base_sentiment
-        
-    # Ensure both dataframes have the same index range
-    common_range = [max(base_sentiment_resampled.index.min(), target_price.index.min()),
-                   min(base_sentiment_resampled.index.max(), target_price.index.max())]
-    
-    # Filter data to common range
-    base_sentiment_aligned = base_sentiment_resampled[
-        (base_sentiment_resampled.index >= common_range[0]) & 
-        (base_sentiment_resampled.index <= common_range[1])
-    ]
-    target_price_aligned = target_price[
-        (target_price.index >= common_range[0]) & 
-        (target_price.index <= common_range[1])
-    ]
-    
-    if len(base_sentiment_aligned) < 10 or len(target_price_aligned) < 10:
-        log.warning(f"Insufficient aligned data points for {base_symbol} -> {target_symbol}")
-        return 0.0
-    
-    # Create a DataFrame with both series
-    analysis_df = pd.DataFrame({
-        'base_sentiment': base_sentiment_aligned['sentiment_score'],
-        'target_returns': target_price_aligned['returns']
-    })
-    
-    # Calculate lagged correlations for different lag periods
-    lag_periods = [1, 2, 3, 6, 12, 24]
-    correlations = {}
-    
-    for lag in lag_periods:
-        # Shift base sentiment forward to align with future target returns
-        analysis_df[f'lagged_sentiment_{lag}'] = analysis_df['base_sentiment'].shift(lag)
-        
-        # Calculate correlation between lagged sentiment and returns
-        corr = analysis_df[f'lagged_sentiment_{lag}'].corr(analysis_df['target_returns'])
-        if not np.isnan(corr):
-            correlations[lag] = corr
-    
-    if not correlations:
-        return 0.0
-    
-    # Find the lag with the highest absolute correlation
-    optimal_lag, max_corr = max(correlations.items(), key=lambda x: abs(x[1]))
-    
-    log.info(f"Sentiment spillover from {base_symbol} to {target_symbol}: {max_corr:.4f} (lag: {optimal_lag})")
-    return max_corr
-
-async def get_cached_spillover_effect(
-    base_symbol: str,
-    target_symbol: str,
-    max_cache_age_hours: int = 24
-) -> float:
-    """
-    Get cached spillover effect or calculate it if not cached.
-    
-    Args:
-        base_symbol: The base symbol (e.g., 'BTC')
-        target_symbol: The target symbol (e.g., 'SOL')
-        max_cache_age_hours: Maximum age of cached values in hours
-        
-    Returns:
-        Spillover coefficient
-    """
-    # Clean symbols
-    base_symbol = base_symbol.replace('USDT', '')
-    target_symbol = target_symbol.replace('USDT', '')
-    
-    now = datetime.datetime.now(pytz.UTC)
-    
-    # Initialize cache for base symbol if needed
-    if base_symbol not in _spillover_cache:
-        _spillover_cache[base_symbol] = {}
-    
-    # Check if we have a valid cached value
-    if target_symbol in _spillover_cache[base_symbol]:
-        spillover, timestamp = _spillover_cache[base_symbol][target_symbol]
-        age = now - timestamp
-        
-        if age.total_seconds() < max_cache_age_hours * 3600:
-            log.debug(f"Using cached spillover effect {base_symbol}->{target_symbol}: {spillover:.4f}")
-            return spillover
-    
-    # Calculate new spillover effect
-    spillover = await calculate_sentiment_spillover(base_symbol, target_symbol)
-    
-    # Cache the result
-    _spillover_cache[base_symbol][target_symbol] = (spillover, now)
-    
-    return spillover
-
-async def analyze_market_influence(
-    target_symbol: str,
-    base_symbols: List[str] = BASE_INFLUENCE_SYMBOLS
-) -> Dict[str, float]:
-    """
-    Analyze how major cryptocurrencies influence the target cryptocurrency.
-    
-    Args:
-        target_symbol: The target symbol to analyze
-        base_symbols: List of base symbols that may influence the target
-        
-    Returns:
-        Dictionary mapping base symbols to influence scores
-    """
-    influence_scores = {}
-    
-    for base in base_symbols:
-        if base in target_symbol:
-            # Skip if base is part of the target (e.g., BTCDOWN)
-            continue
-            
-        spillover = await get_cached_spillover_effect(base, target_symbol)
-        if abs(spillover) >= 0.1:  # Only consider meaningful correlations
-            influence_scores[base] = spillover
-    
-    return influence_scores
-
-async def get_cross_asset_influence_score(
-    target_symbol: str,
-    current_base_sentiments: Dict[str, float]
-) -> float:
-    """
-    Calculate the cross-asset influence score for a target asset,
-    based on current sentiment of influential base assets.
-    
-    Args:
-        target_symbol: The target symbol to analyze
-        current_base_sentiments: Current sentiment scores for base assets
-        
-    Returns:
-        Influence score for the target asset
-    """
-    target_clean = target_symbol.replace('USDT', '')
-    
-    # If target is a base asset itself, return its own sentiment
-    if target_clean in current_base_sentiments:
-        return current_base_sentiments[target_clean]
-    
-    influence_scores = await analyze_market_influence(target_clean)
-    
-    if not influence_scores:
-        return 0.0
-    
-    # Calculate weighted average of influential base sentiments
-    weighted_score = 0.0
-    total_weight = 0.0
-    
-    for base, influence in influence_scores.items():
-        if base in current_base_sentiments:
-            # Use absolute influence as weight, but keep the sign for direction
-            weight = abs(influence)
-            weighted_score += current_base_sentiments[base] * influence
-            total_weight += weight
-    
-    if total_weight > 0:
-        return weighted_score / total_weight
-    else:
-        return 0.0
-
-# Function to be called from the trader module
-async def get_cross_asset_adjusted_prediction(
+async def get_symbol_sentiment_history(
     symbol: str,
-    prediction: Tuple[int, float],
-    current_market_sentiments: Dict[str, float]
-) -> Tuple[int, float]:
+    start_date: datetime,
+    end_date: datetime
+) -> Optional[pd.Series]:
     """
-    Adjust prediction based on cross-asset sentiment influence.
-    
-    Args:
-        symbol: Trading pair symbol
-        prediction: Tuple of (prediction_class, probability)
-        current_market_sentiments: Current sentiment scores for major assets
+    Get historical sentiment data for a symbol.
+    Returns time series of sentiment scores.
+    """
+    try:
+        # Query sentiment data from database
+        query = f"""
+        SELECT timestamp, sentiment_score
+        FROM sentiment_analysis_results
+        WHERE symbol = $1 
+        AND timestamp BETWEEN $2 AND $3
+        ORDER BY timestamp
+        """
         
-    Returns:
-        Adjusted prediction tuple (class, probability)
-    """
-    pred_class, prob = prediction
-    
-    # Skip adjustment if sentiments not available
-    if not current_market_sentiments:
-        return prediction
-    
-    # Get influence score from cross-asset analysis
-    influence_score = await get_cross_asset_influence_score(symbol, current_market_sentiments)
-    
-    if abs(influence_score) < 0.1:
-        # Not enough influence to adjust prediction
-        return prediction
-    
-    # Scale the adjustment based on the strength of the influence
-    adjustment_factor = influence_score * 0.15
-    adjusted_prob = prob + adjustment_factor
-    
-    # Ensure the probability stays in [0, 1] range
-    adjusted_prob = max(0.0, min(1.0, adjusted_prob))
-    
-    # Adjust prediction class if probability crosses the threshold
-    adjusted_class = 1 if adjusted_prob >= 0.5 else 0
-    
-    log.info(f"Cross-asset adjusted prediction for {symbol}: {pred_class}→{adjusted_class}, " +
-             f"{prob:.4f}→{adjusted_prob:.4f} (Influence score: {influence_score:.4f})")
-    
-    return (adjusted_class, adjusted_prob)
+        async with config.DB_POOL.acquire() as conn:
+            rows = await conn.fetch(query, symbol, start_date, end_date)
+            
+        if not rows:
+            return None
+        
+        # Convert to pandas Series
+        data = {row['timestamp']: row['sentiment_score'] for row in rows}
+        return pd.Series(data)
+        
+    except Exception as e:
+        log.error(f"Error getting sentiment history for {symbol}: {e}")
+        return None
 
-async def get_current_base_sentiments() -> Dict[str, float]:
+async def get_sentiment_divergence(
+    symbols: List[str],
+    lookback_days: int = 7
+) -> Optional[Dict[str, Any]]:
     """
-    Get current sentiment scores for base influential cryptocurrencies.
-    
-    Returns:
-        Dictionary mapping symbols to sentiment scores
+    Analyze divergences between asset sentiment trends.
+    Returns pairs of assets with diverging sentiment.
     """
-    engine = db_utils.engine
-    if not engine:
-        log.error("Database engine not available")
-        return {}
-    
-    end_time = datetime.datetime.now(pytz.UTC)
-    start_time = end_time - timedelta(hours=24)
-    
-    sentiments = {}
-    async with AsyncRateLimiter(rate_limit=5, period=1):  # Limit to 5 queries per second
-        for base in BASE_INFLUENCE_SYMBOLS:
-            sentiment_df = await fetch_sentiment_data(engine, base, start_time, end_time)
-            if not sentiment_df.empty:
-                # Calculate weighted average of recent sentiment, giving more weight to recent data
-                weights = np.linspace(0.5, 1.0, len(sentiment_df))
-                avg_sentiment = np.average(sentiment_df['sentiment_score'], weights=weights)
-                sentiments[base] = avg_sentiment
-    
-    return sentiments
+    try:
+        end_date = datetime.now(pytz.UTC)
+        start_date = end_date - timedelta(days=lookback_days)
+        
+        # Get sentiment trends
+        trends = {}
+        for symbol in symbols:
+            history = await get_symbol_sentiment_history(symbol, start_date, end_date)
+            if history is not None:
+                # Calculate trend using linear regression
+                x = np.arange(len(history))
+                y = history.values
+                trend = np.polyfit(x, y, 1)[0]  # Get slope
+                trends[symbol] = trend
+        
+        if not trends:
+            return None
+        
+        # Find diverging pairs
+        divergences = []
+        for sym1 in trends:
+            for sym2 in trends:
+                if sym1 < sym2:  # Avoid duplicates
+                    trend1, trend2 = trends[sym1], trends[sym2]
+                    if trend1 * trend2 < 0:  # Opposite trends
+                        divergences.append({
+                            'symbol1': sym1,
+                            'symbol2': sym2,
+                            'trend1': float(trend1),
+                            'trend2': float(trend2)
+                        })
+        
+        results = {
+            'divergences': divergences,
+            'timestamp': datetime.now(pytz.UTC)
+        }
+        
+        await async_bulk_insert([results], 'sentiment_divergences')
+        return results
+        
+    except Exception as e:
+        log.error(f"Error analyzing sentiment divergence: {e}")
+        return None
+
+async def get_sentiment_momentum(
+    symbols: List[str],
+    short_window: int = 1,
+    long_window: int = 7
+) -> Optional[Dict[str, Any]]:
+    """
+    Calculate sentiment momentum indicators for assets.
+    Returns momentum scores for each asset.
+    """
+    try:
+        end_date = datetime.now(pytz.UTC)
+        long_start = end_date - timedelta(days=long_window)
+        short_start = end_date - timedelta(days=short_window)
+        
+        momentum_scores = {}
+        for symbol in symbols:
+            # Get long and short-term sentiment
+            long_hist = await get_symbol_sentiment_history(symbol, long_start, end_date)
+            short_hist = await get_symbol_sentiment_history(symbol, short_start, end_date)
+            
+            if long_hist is not None and short_hist is not None:
+                long_avg = float(long_hist.mean())
+                short_avg = float(short_hist.mean())
+                momentum = short_avg - long_avg
+                
+                momentum_scores[symbol] = {
+                    'short_term_sentiment': short_avg,
+                    'long_term_sentiment': long_avg,
+                    'momentum': momentum
+                }
+        
+        if not momentum_scores:
+            return None
+        
+        results = {
+            'momentum_scores': momentum_scores,
+            'timestamp': datetime.now(pytz.UTC)
+        }
+        
+        await async_bulk_insert([results], 'sentiment_momentum')
+        return results
+        
+    except Exception as e:
+        log.error(f"Error calculating sentiment momentum: {e}")
+        return None

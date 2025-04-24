@@ -1,20 +1,16 @@
 # /data_collection/cryptonews_client.py
 
 import logging
-import requests
 import datetime
-import pytz # For timezone handling
-import pandas as pd
-from typing import List, Dict, Optional, Tuple # <-- Added Tuple here
-import time # Import time for potential delays
-import json # Import json for serialization if needed
+import pytz
+from typing import List, Dict, Optional, Tuple, Any
+import aiohttp
+import asyncio
 from tenacity import retry, stop_after_attempt, wait_exponential
+import json
 
-# Use absolute imports assuming 'cyclonev2' is the project root added to PYTHONPATH
 import config
-from database import db_utils # Import needed for JSON_TYPE check
-# from .. import config # Use relative import if running as part of a package
-# from ..database import db_utils
+from database.db_utils import async_bulk_insert
 
 log = logging.getLogger(__name__)
 
@@ -27,33 +23,11 @@ SOURCE_TIMEZONE_STR = 'US/Eastern'
 try:
     SOURCE_TIMEZONE = pytz.timezone(SOURCE_TIMEZONE_STR)
 except pytz.exceptions.UnknownTimeZoneError:
-    log.error(f"Unknown timezone '{SOURCE_TIMEZONE_STR}'. Using UTC as fallback for ET conversion.")
-    SOURCE_TIMEZONE = pytz.utc # Fallback, though calculations might be off
-
-TARGET_TIMEZONE = pytz.utc # Store everything in UTC
-
-def _parse_cryptonews_date(date_str: Optional[str]) -> Optional[datetime.datetime]:
-    """Parses date string from API (assuming various formats) and converts to UTC."""
-    if not date_str:
-        return None
-    try:
-        # Try parsing formats with timezone offset first (more reliable)
-        # Example: "Fri, 08 Mar 2024 14:01:09 -0500"
-        # Pandas to_datetime is quite flexible
-        dt_aware = pd.to_datetime(date_str, utc=False) # Parse as naive first or aware if offset exists
-        if dt_aware.tzinfo:
-            # If pandas parsed timezone info, convert directly to UTC
-            return dt_aware.tz_convert(TARGET_TIMEZONE)
-        else:
-            # If naive, assume it's in the SOURCE_TIMEZONE (e.g., ET) and convert
-            dt_aware_source = SOURCE_TIMEZONE.localize(dt_aware)
-            return dt_aware_source.astimezone(TARGET_TIMEZONE)
-    except Exception as e:
-        log.warning(f"Could not parse CryptoNews date '{date_str}': {e}. Returning None.")
-        return None
+    log.error(f"Could not find timezone {SOURCE_TIMEZONE_STR}. Falling back to UTC.")
+    SOURCE_TIMEZONE = pytz.UTC
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def _make_api_request(endpoint_path: str, params: Dict) -> Optional[Dict]:
+async def _make_api_request(endpoint_path: str, params: Dict) -> Optional[Dict]:
     """Helper function to make requests and handle common errors with retry logic."""
     if not CRYPTONEWS_API_TOKEN:
         log.error("CryptoNews API Token is not configured.")
@@ -62,216 +36,177 @@ def _make_api_request(endpoint_path: str, params: Dict) -> Optional[Dict]:
     params['token'] = CRYPTONEWS_API_TOKEN
     url = f"{CRYPTONEWS_BASE_URL}{endpoint_path}"
 
-    log.debug(f"Making CryptoNews API request to {url} with params: {params}")
+    log.debug(f"Making CryptoNews API request to {url}")
     try:
-        response = requests.get(url, params=params, timeout=30)
-        log.debug(f"CryptoNews API response status: {response.status_code}")
-        response.raise_for_status()
-        data = response.json()
-
-        if 'error' in data and data['error']:
-            log.error(f"CryptoNews API returned an error for {url} with params {params}: {data['error']}")
-            return None
-
-        return data
-
-    except requests.exceptions.Timeout:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=30) as response:
+                log.debug(f"CryptoNews API response status: {response.status}")
+                
+                if response.status == 200:
+                    data = await response.json()
+                    if 'error' in data and data['error']:
+                        log.error(f"CryptoNews API returned an error: {data['error']}")
+                        return None
+                    return data
+                else:
+                    log.error(f"CryptoNews API request failed with status {response.status}")
+                    return None
+                    
+    except asyncio.TimeoutError:
         log.error(f"Timeout error fetching data from CryptoNews API: {url}")
-    except requests.exceptions.RequestException as e:
-        log.error(f"Request error fetching news from CryptoNews API: {e}", exc_info=False)
-        if e.response is not None:
-            log.error(f"Response status: {e.response.status_code}, Body: {e.response.text[:500]}...")
     except Exception as e:
-        log.error(f"Unexpected error processing CryptoNews request or response: {e}", exc_info=True)
-
+        log.error(f"Error processing CryptoNews request: {e}", exc_info=True)
+    
     return None
 
-def _process_news_articles(raw_articles: List[Dict], source_api_name: str = 'cryptonews') -> List[Dict]:
-    """Processes a list of raw article dicts from the API response."""
-    processed_items = []
-    if not isinstance(raw_articles, list):
-        log.warning(f"Expected a list of articles, but got {type(raw_articles)}. Skipping processing.")
-        return []
-
-    for article in raw_articles:
-        try:
-            # --- Corrected: Use the parsing function ---
-            published_at_utc = _parse_cryptonews_date(article.get('date'))
-            url = article.get('news_url')
-
-            if url and published_at_utc: # Require URL and valid date
-                tickers = article.get('tickers')
-                # Ensure tickers is stored appropriately for DB (JSON string or list)
-                # Check the actual type name of the JSON type object from db_utils
-                is_json_type = db_utils.JSON_TYPE.__name__ == 'JSON' or db_utils.JSON_TYPE.__name__ == 'JSONB'
-
-                if isinstance(tickers, list) and is_json_type:
-                    tickers_stored = tickers # Store as list if DB supports JSON/JSONB
-                elif isinstance(tickers, list):
-                    tickers_stored = json.dumps(tickers) # Convert list to JSON string for TEXT columns
-                else:
-                    tickers_stored = None # Or handle other types if necessary
-
-                processed_items.append({
-                    'source_api': source_api_name,
-                    'source_publisher': article.get('source_name'),
-                    'article_id': None, # Not obviously available in examples
-                    'title': article.get('title'),
-                    'text_content': article.get('text'),
-                    'url': url,
-                    'published_at': published_at_utc, # Store converted UTC datetime
-                    'tickers_mentioned': tickers_stored,
-                })
-            else:
-                 log.debug(f"Skipping article due to missing URL or unparseable/missing date: URL='{url}', Date='{article.get('date')}'")
-        except Exception as item_err:
-            log.error(f"Error processing individual news article: {item_err}. Article data: {article}", exc_info=True)
-    return processed_items
-
-
-def fetch_ticker_news(tickers: List[str], items_per_page: int = 50, page: int = 1) -> List[Dict]:
-    """
-    Fetches the *latest* news for specific tickers from the CryptoNews API.
-    Uses the default endpoint which implies /posts or similar based on examples.
-
-    Args:
-        tickers (List[str]): A list of ticker symbols (e.g., ['BTC', 'ETH']).
-        items_per_page (int): Number of news items to fetch (max 50-100, check docs).
-        page (int): Page number for pagination.
-
-    Returns:
-        List[Dict]: A list of processed news article dictionaries. Empty list on failure.
-    """
-    if not tickers:
-        log.warning("No tickers provided to fetch news for.")
-        return []
-
-    # Assuming '/posts' or just the base URL works for ticker filtering based on docs
-    # If docs specify '/category?section=alltickers&tickers=...', adjust endpoint_path
-    endpoint_path = ""
-    ticker_string = ",".join(tickers).upper()
+async def fetch_ticker_news(tickers: List[str], items_per_page: int = 50) -> List[Dict]:
+    """Fetch latest news for specified tickers."""
     params = {
-        "tickers": ticker_string,
-        "items": min(items_per_page, 100), # Use 100 as a safe max, adjust if known
-        "page": page,
-        # No date parameter means fetch latest
+        'tickers': ','.join(tickers),
+        'items': items_per_page,
+        'page': 1,
+        'type': 'article'
     }
 
-    log.info(f"Fetching LATEST CryptoNews for tickers: {ticker_string}, page: {page}, items: {params['items']}")
-    data = _make_api_request(endpoint_path, params)
-
-    if data and isinstance(data.get('data'), list):
-        return _process_news_articles(data['data'])
-    else:
-        log.debug(f"No valid 'data' list found in response for latest news fetch: {ticker_string}")
+    data = await _make_api_request('/news', params)
+    if not data:
         return []
 
-
-def fetch_historical_ticker_news(tickers: List[str], date_str: str, items_per_page: int = 50, page: int = 1) -> Tuple[List[Dict], bool]:
-    """
-    Fetches HISTORICAL news for specific tickers from the CryptoNews API using the date parameter.
-
-    Args:
-        tickers (List[str]): A list of ticker symbols (e.g., ['BTC', 'ETH']).
-        date_str (str): Date range string in API format (e.g., 'MMDDYYYY-MMDDYYYY' or 'last7days').
-        items_per_page (int): Number of news items to fetch (max 50-100).
-        page (int): Page number for pagination.
-
-    Returns:
-        Tuple[List[Dict], bool]:
-            - A list of processed news article dictionaries. Empty list on failure.
-            - Boolean indicating if more pages might be available (True if items_per_page == returned count, False otherwise).
-    """
-    if not tickers:
-        log.warning("No tickers provided to fetch historical news for.")
-        return [], False
-    if not date_str:
-        log.warning("Date string parameter is required for historical fetching.")
-        return [], False
-
-    endpoint_path = ""
-    ticker_string = ",".join(tickers).upper()
-    params = {
-        "tickers": ticker_string,
-        "items": min(items_per_page, 100),
-        "page": page,
-        "date": date_str
-    }
-
-    log.info(f"Fetching HISTORICAL CryptoNews for tickers: {ticker_string}, Date: {date_str}, page: {page}, items: {params['items']}")
-    data = _make_api_request(endpoint_path, params)
     news_items = []
-    has_more_pages = False
+    for item in data.get('data', []):
+        # Convert naive datetime to timezone-aware
+        published_dt = datetime.datetime.strptime(
+            item['date'],
+            '%Y-%m-%d %H:%M:%S'
+        ).replace(tzinfo=SOURCE_TIMEZONE).astimezone(pytz.UTC)
 
-    if data and isinstance(data.get('data'), list):
-        raw_articles = data['data']
-        log.info(f"Received {len(raw_articles)} historical news items from CryptoNews API for tickers {ticker_string}, date {date_str}, page {page}.")
-        news_items = _process_news_articles(raw_articles)
+        processed_item = {
+            'source_api': 'cryptonews',
+            'source_publisher': item.get('source_name'),
+            'article_id': str(item.get('news_id')),
+            'title': item.get('title'),
+            'text_content': item.get('text'),
+            'url': item.get('news_url'),
+            'published_at': published_dt,
+            'tickers_mentioned': item.get('tickers', []),
+            'fetched_at': datetime.datetime.now(pytz.utc)
+        }
+        news_items.append(processed_item)
 
-        if len(raw_articles) == params['items']:
-            has_more_pages = True
+    # Store news items in database
+    if news_items:
+        try:
+            await async_bulk_insert(news_items, 'news_data')
+            log.info(f"Successfully stored {len(news_items)} news items")
+        except Exception as e:
+            log.error(f"Error storing news items in database: {e}")
 
-    else:
-        log.debug(f"No valid 'data' list found in response for historical news fetch: {ticker_string}, date {date_str}, page {page}")
+    return news_items
+
+async def fetch_historical_ticker_news(
+    tickers: List[str],
+    date_str: str,
+    items_per_page: int = 100,
+    page: int = 1
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    Fetch historical news for specified tickers.
+    Returns tuple of (news_items, has_more_pages).
+    """
+    params = {
+        'tickers': ','.join(tickers),
+        'items': items_per_page,
+        'page': page,
+        'date': date_str,
+        'type': 'article'
+    }
+
+    data = await _make_api_request('/news', params)
+    if not data:
+        return [], False
+
+    news_items = []
+    for item in data.get('data', []):
+        # Convert naive datetime to timezone-aware
+        published_dt = datetime.datetime.strptime(
+            item['date'],
+            '%Y-%m-%d %H:%M:%S'
+        ).replace(tzinfo=SOURCE_TIMEZONE).astimezone(pytz.UTC)
+
+        processed_item = {
+            'source_api': 'cryptonews',
+            'source_publisher': item.get('source_name'),
+            'article_id': str(item.get('news_id')),
+            'title': item.get('title'),
+            'text_content': item.get('text'),
+            'url': item.get('news_url'),
+            'published_at': published_dt,
+            'tickers_mentioned': item.get('tickers', []),
+            'fetched_at': datetime.datetime.now(pytz.utc)
+        }
+        news_items.append(processed_item)
+
+    # Determine if there are more pages
+    total_pages = data.get('total_pages', 1)
+    has_more_pages = page < total_pages
+
+    # Store news items in database
+    if news_items:
+        try:
+            await async_bulk_insert(news_items, 'news_data')
+            log.info(f"Successfully stored {len(news_items)} historical news items from page {page}")
+        except Exception as e:
+            log.error(f"Error storing historical news items in database: {e}")
 
     return news_items, has_more_pages
 
-
-# --- Example Usage (for testing) ---
-if __name__ == '__main__':
-    # Setup basic logging for direct script run
-    logging.basicConfig(level=config.LOG_LEVEL, format='%(asctime)s - %(levelname)s [%(name)s:%(lineno)d] %(message)s')
-
-    print("--- Testing CryptoNews Client ---")
-
-    if not config.CRYPTONEWS_API_TOKEN:
-         print("\nERROR: CryptoNews API Token (CRYPTONEWS_API_TOKEN) not configured in .env")
-    else:
-        test_tickers = ['BTC', 'ETH']
-
-        # Test fetching latest news
-        print(f"\nFetching latest news for tickers: {test_tickers}...")
-        latest_news = fetch_ticker_news(tickers=test_tickers, items_per_page=5)
-        if latest_news:
-            print(f"Fetched {len(latest_news)} latest news items.")
-            if latest_news:
-                 print("First item details:")
-                 print(latest_news[0])
+async def fetch_crypto_news(
+    symbol: str,
+    from_date: Optional[datetime.datetime] = None,
+    to_date: Optional[datetime.datetime] = None,
+    limit: int = 50
+) -> List[Dict[str, Any]]:
+    """
+    Fetch crypto news for a specific symbol/ticker for the dashboard.
+    
+    Args:
+        symbol: Ticker symbol to fetch news for (e.g., 'BTC')
+        from_date: Start date for news articles
+        to_date: End date for news articles
+        limit: Maximum number of articles to fetch
+        
+    Returns:
+        List of news articles with metadata
+    """
+    try:
+        log.info(f"Fetching crypto news for {symbol} from {from_date} to {to_date}")
+        
+        # Format the symbol for API request
+        # Strip USDT if present (convert BTCUSDT to BTC)
+        if symbol.endswith('USDT'):
+            ticker = symbol[:-4]
         else:
-            print("Could not fetch latest news or no news found.")
-
-        print("\n" + "="*20 + "\n")
-
-        # Test fetching historical news (last 7 days)
-        print(f"\nFetching historical news for tickers: {test_tickers} (last7days)...")
-        page = 1
-        all_historical = []
-        while True:
-            historical_news_page, more_pages = fetch_historical_ticker_news(
-                tickers=test_tickers,
-                date_str='last7days', # Use the API's relative date string
-                items_per_page=5, # Small number for testing pagination
-                page=page
+            ticker = symbol
+            
+        # If from_date is provided, fetch historical news
+        if from_date:
+            # Format date for API request (YYYY-MM-DD)
+            date_str = from_date.strftime('%Y-%m-%d')
+            news_items, _ = await fetch_historical_ticker_news(
+                tickers=[ticker],
+                date_str=date_str,
+                items_per_page=limit,
+                page=1
             )
-            if historical_news_page:
-                all_historical.extend(historical_news_page)
-                if more_pages:
-                     page += 1
-                     print(f"Fetching next page ({page})...")
-                     time.sleep(1) # Delay between pages
-                else:
-                     print("No more pages indicated.")
-                     break
-            else:
-                 print(f"Could not fetch historical news on page {page} or no news found.")
-                 break
-
-        if all_historical:
-            print(f"Fetched {len(all_historical)} total historical news items.")
-            print("First historical item details:")
-            print(all_historical[0])
         else:
-             print("No historical news fetched.")
-
-
-    print("\n--- Test Complete ---")
+            # Fetch latest news
+            news_items = await fetch_ticker_news(
+                tickers=[ticker],
+                items_per_page=limit
+            )
+            
+        return news_items
+        
+    except Exception as e:
+        log.error(f"Error fetching crypto news for {symbol}: {e}")
+        return []

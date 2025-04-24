@@ -25,7 +25,11 @@ from database.db_utils import (
     sentiment_analysis_results,
     cryptopanic_sentiment,
     alphavantage_health,
-    coingecko_metrics
+    coingecko_metrics,
+    low_value_coin_sentiment,
+    low_value_cross_coin_metrics,
+    news_data,
+    social_media_data
 )
 
 log = logging.getLogger(__name__)
@@ -64,6 +68,113 @@ def fetch_sentiment_data(engine, start_time_utc: datetime.datetime, end_time_utc
     
     return pd.read_sql(stmt, engine, index_col='analyzed_at', parse_dates=['analyzed_at'])
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def fetch_low_value_coin_sentiment_data(engine, symbol: str, start_time_utc: datetime.datetime, end_time_utc: datetime.datetime) -> DataFrame:
+    """
+    Fetches specialized sentiment data for low-value coins.
+    
+    This function retrieves sentiment analysis specifically for cryptocurrencies valued under $1,
+    which provides more targeted sentiment metrics for these types of coins.
+    
+    Args:
+        engine: SQLAlchemy engine
+        symbol: Cryptocurrency symbol (without USDT suffix)
+        start_time_utc: Start time for data retrieval
+        end_time_utc: End time for data retrieval
+        
+    Returns:
+        DataFrame with sentiment data for the specified symbol
+    """
+    stmt = select(low_value_coin_sentiment).where(
+        and_(
+            low_value_coin_sentiment.c.symbol == symbol,
+            low_value_coin_sentiment.c.timestamp.between(start_time_utc, end_time_utc)
+        )
+    ).order_by(low_value_coin_sentiment.c.timestamp)
+    
+    df = pd.read_sql(stmt, engine, index_col='timestamp', parse_dates=['timestamp'])
+    
+    if df.empty:
+        log.debug(f"No low-value coin sentiment data available for {symbol}")
+    else:
+        log.debug(f"Retrieved {len(df)} rows of low-value coin sentiment data for {symbol}")
+        
+    return df
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def fetch_cross_coin_sentiment_metrics(engine, start_time_utc: datetime.datetime, end_time_utc: datetime.datetime) -> DataFrame:
+    """
+    Fetches cross-coin sentiment metrics that compare sentiment across all low-value coins.
+    
+    This provides market-wide sentiment context which can be valuable for identifying 
+    sentiment-driven trading opportunities in the broader low-value coin market.
+    
+    Args:
+        engine: SQLAlchemy engine
+        start_time_utc: Start time for data retrieval
+        end_time_utc: End time for data retrieval
+        
+    Returns:
+        DataFrame with cross-coin sentiment metrics
+    """
+    stmt = select(low_value_cross_coin_metrics).where(
+        low_value_cross_coin_metrics.c.timestamp.between(start_time_utc, end_time_utc)
+    ).order_by(low_value_cross_coin_metrics.c.timestamp)
+    
+    df = pd.read_sql(stmt, engine, index_col='timestamp', parse_dates=['timestamp'])
+    
+    if df.empty:
+        log.debug("No cross-coin sentiment metrics available")
+    else:
+        log.debug(f"Retrieved {len(df)} rows of cross-coin sentiment metrics")
+        
+    return df
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def _fetch_general_sentiment_data(engine, symbol: str, start_time_utc: datetime.datetime, end_time_utc: datetime.datetime) -> DataFrame:
+    """Fetches sentiment scores from news_data and social_media_data."""
+    log.debug(f"Fetching general sentiment for {symbol} from {start_time_utc} to {end_time_utc}")
+    
+    # Fetch from news_data
+    news_stmt = select(
+        news_data.c.published_at.label('timestamp'),
+        news_data.c.sentiment_score,
+        news_data.c.sentiment_magnitude
+    ).where(
+        and_(
+            news_data.c.symbol == symbol,
+            news_data.c.published_at.between(start_time_utc, end_time_utc),
+            news_data.c.sentiment_score.is_not(None)
+        )
+    )
+    news_df = pd.read_sql(news_stmt, engine, index_col='timestamp', parse_dates=['timestamp'])
+    news_df['source'] = 'news'
+    
+    # Fetch from social_media_data
+    social_stmt = select(
+        social_media_data.c.created_at.label('timestamp'),
+        social_media_data.c.sentiment_score,
+        social_media_data.c.sentiment_magnitude,
+        social_media_data.c.platform
+    ).where(
+        and_(
+            social_media_data.c.symbol == symbol,
+            social_media_data.c.created_at.between(start_time_utc, end_time_utc),
+            social_media_data.c.sentiment_score.is_not(None)
+        )
+    )
+    social_df = pd.read_sql(social_stmt, engine, index_col='timestamp', parse_dates=['timestamp'])
+    social_df['source'] = social_df['platform']
+    social_df = social_df.drop(columns=['platform'])
+
+    # Combine and return
+    combined_df = pd.concat([news_df, social_df])
+    combined_df = _ensure_datetime_index(combined_df)
+    combined_df = combined_df.sort_index()
+    
+    log.debug(f"Fetched {len(combined_df)} general sentiment records for {symbol}")
+    return combined_df
+
 def _ensure_datetime_index(df: DataFrame) -> DataFrame:
     """Ensure DataFrame has a timezone-aware datetime index."""
     if not isinstance(df.index, DatetimeIndex):
@@ -79,114 +190,58 @@ def _ensure_datetime_index(df: DataFrame) -> DataFrame:
 
 def _calculate_rolling_sentiment(sentiment_df: DataFrame, price_timestamps: DatetimeIndex, window: str) -> Series:
     """Calculates rolling average sentiment scores aligned with price timestamps."""
-    # Ensure index is datetime
     sentiment_df = _ensure_datetime_index(sentiment_df)
-    
-    # Resample to 1-minute frequency first
     resampled = sentiment_df.resample(rule='1Min')['sentiment_score'].mean()
-    
-    # Forward fill missing values within the window
-    limit = int(pd.Timedelta(window).total_seconds() / 60)  # Convert window to minutes
-    
-    # Use type ignores for pandas internal typing issues
-    filled = resampled.fillna(method='ffill', limit=limit)  # type: ignore
-    
+    limit = int(pd.Timedelta(window).total_seconds() / 60)
+    filled = resampled.fillna(method='ffill', limit=limit)
     return cast(Series, filled)
 
-def _calculate_target(price_df: pd.DataFrame, periods: int) -> pd.Series:
-    """
-    Calculates the target variable: 1 if price increased N periods later, 0 otherwise.
+def _calculate_general_sentiment_features(general_sentiment_df: DataFrame, price_index: DatetimeIndex, windows: List[str] = SENTIMENT_WINDOWS) -> DataFrame:
+    """Calculates aggregated features from general news/social sentiment."""
+    if general_sentiment_df.empty:
+        return pd.DataFrame(index=price_index)
 
-    Args:
-        price_df (pd.DataFrame): DataFrame with 'close' prices, indexed by time.
-        periods (int): Number of periods ahead to look for price increase.
+    sentiment_features = pd.DataFrame(index=price_index)
+    general_sentiment_df = _ensure_datetime_index(general_sentiment_df)
 
-    Returns:
-        pd.Series: Series with target variable (1 or 0), indexed by time.
-                   NaN where future price is not available.
-    """
-    future_close = price_df['close'].shift(-periods)
-    target = (future_close > price_df['close']).astype(float) # Use float 1.0 / 0.0, NaN where future unknown
-    target.name = f'target_up_{periods}p'
-    # Where future_close is NaN (at the end of the series), target will be NaN
-    log.debug(f"Calculated target variable for {periods} periods ahead.")
-    return target
+    resample_interval = config.CANDLE_INTERVAL
+    resampled_sentiment = general_sentiment_df.resample(resample_interval).agg(
+        sentiment_score=('sentiment_score', 'mean'),
+        sentiment_magnitude=('sentiment_magnitude', 'mean'),
+        record_count=('source', 'count')
+    ).reindex(price_index)
 
-def _fetch_api_features(engine, symbol: str, start_time_utc: datetime.datetime, end_time_utc: datetime.datetime) -> Dict[str, DataFrame]:
-    """Fetches features from CryptoPanic, AlphaVantage, and CoinGecko APIs."""
-    api_features: Dict[str, DataFrame] = {}
-    
-    # Fetch CryptoPanic sentiment data
-    stmt = select(cryptopanic_sentiment).where(
-        and_(
-            cryptopanic_sentiment.c.symbol == symbol,
-            cryptopanic_sentiment.c.timestamp.between(start_time_utc, end_time_utc)
+    for window in windows:
+        rolling_agg = resampled_sentiment.rolling(window, closed='left').agg(
+            mean_score=('sentiment_score', 'mean'),
+            mean_magnitude=('sentiment_magnitude', 'mean'),
+            sum_count=('record_count', 'sum')
         )
-    ).order_by(cryptopanic_sentiment.c.timestamp)
-    
-    api_features['cryptopanic'] = pd.read_sql(stmt, engine, index_col='timestamp')
+        sentiment_features[f'gen_sent_score_avg_{window}'] = rolling_agg['mean_score']
+        sentiment_features[f'gen_sent_mag_avg_{window}'] = rolling_agg['mean_magnitude']
+        sentiment_features[f'gen_sent_count_{window}'] = rolling_agg['sum_count']
 
-    # Fetch AlphaVantage health data
-    stmt = select(alphavantage_health).where(
-        and_(
-            alphavantage_health.c.symbol == symbol,
-            alphavantage_health.c.timestamp.between(start_time_utc, end_time_utc)
-        )
-    ).order_by(alphavantage_health.c.timestamp)
-    
-    api_features['alphavantage'] = pd.read_sql(stmt, engine, index_col='timestamp')
+        for source in ['news', 'twitter', 'reddit']:
+            source_df = general_sentiment_df[general_sentiment_df['source'] == source]
+            if not source_df.empty:
+                resampled_source = source_df.resample(resample_interval).agg(
+                    sentiment_score=('sentiment_score', 'mean'),
+                    record_count=('source', 'count')
+                ).reindex(price_index)
+                 
+                rolling_source_agg = resampled_source.rolling(window, closed='left').agg(
+                    mean_score=('sentiment_score', 'mean'),
+                    sum_count=('record_count', 'sum')
+                )
+                sentiment_features[f'{source}_sent_score_avg_{window}'] = rolling_source_agg['mean_score']
+                sentiment_features[f'{source}_sent_count_{window}'] = rolling_source_agg['sum_count']
 
-    # Fetch CoinGecko metrics data
-    stmt = select(coingecko_metrics).where(
-        and_(
-            coingecko_metrics.c.symbol == symbol,
-            coingecko_metrics.c.timestamp.between(start_time_utc, end_time_utc)
-        )
-    ).order_by(coingecko_metrics.c.timestamp)
-    
-    api_features['coingecko'] = pd.read_sql(stmt, engine, index_col='timestamp')
+    for window in windows:
+        col_name = f'gen_sent_score_avg_{window}'
+        if col_name in sentiment_features:
+            sentiment_features[f'{col_name}_roc'] = sentiment_features[col_name].pct_change()
 
-    return api_features
-
-def _calculate_api_features(api_data: Dict[str, pd.DataFrame], features_df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates features from API data and adds them to the feature DataFrame."""
-    
-    # Process CryptoPanic features
-    if not api_data['cryptopanic'].empty:
-        features_df['cp_sentiment_score'] = api_data['cryptopanic']['sentiment_score']
-        features_df['cp_bullish_ratio'] = api_data['cryptopanic']['bullish_count'] / api_data['cryptopanic']['total_articles']
-        
-        # Rolling features
-        for window in ['1h', '4h', '12h', '24h']:
-            features_df[f'cp_sent_avg_{window}'] = api_data['cryptopanic']['sentiment_score'].rolling(window, closed='left').mean()
-            features_df[f'cp_bull_ratio_{window}'] = (api_data['cryptopanic']['bullish_count'] / api_data['cryptopanic']['total_articles']).rolling(window, closed='left').mean()
-
-    # Process AlphaVantage features
-    if not api_data['alphavantage'].empty:
-        features_df['av_health_score'] = api_data['alphavantage']['health_score']
-        features_df['av_rsi'] = api_data['alphavantage']['rsi']
-        features_df['av_macd'] = api_data['alphavantage']['macd']
-        features_df['av_macd_signal'] = api_data['alphavantage']['macd_signal']
-        
-        # Calculate MACD crossover signal
-        features_df['av_macd_cross'] = np.where(
-            api_data['alphavantage']['macd'] > api_data['alphavantage']['macd_signal'], 1, -1
-        )
-
-    # Process CoinGecko features
-    if not api_data['coingecko'].empty:
-        features_df['cg_market_cap'] = api_data['coingecko']['market_cap']
-        features_df['cg_volume'] = api_data['coingecko']['total_volume']
-        features_df['cg_price_change_24h'] = api_data['coingecko']['price_change_24h']
-        features_df['cg_price_change_7d'] = api_data['coingecko']['price_change_7d']
-        features_df['cg_market_rank'] = api_data['coingecko']['market_cap_rank']
-        features_df['cg_community_score'] = api_data['coingecko']['community_score']
-        features_df['cg_interest_score'] = api_data['coingecko']['public_interest_score']
-        
-        # Calculate market cap to volume ratio
-        features_df['cg_mcap_vol_ratio'] = api_data['coingecko']['market_cap'] / api_data['coingecko']['total_volume']
-
-    return features_df
+    return sentiment_features
 
 def generate_technical_features(df: pd.DataFrame, 
                               sma_periods: List[int] = [20, 50], 
@@ -195,17 +250,14 @@ def generate_technical_features(df: pd.DataFrame,
     """Generate technical analysis features from price data."""
     df = df.copy()
     
-    # SMA features
     for period in sma_periods:
         df[f'sma_{period}'] = df['close'].rolling(window=period).mean()
         df[f'sma_{period}_slope'] = df[f'sma_{period}'].diff()
     
-    # EMA features
     for period in ema_periods:
         df[f'ema_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
         df[f'ema_{period}_slope'] = df[f'ema_{period}'].diff()
     
-    # RSI
     delta = df['close'].astype(float).diff()
     gain = delta.where(delta > 0, 0.0).rolling(window=rsi_period).mean()
     loss = (-delta.where(delta < 0, 0.0)).rolling(window=rsi_period).mean()
@@ -219,28 +271,23 @@ def generate_volume_features(df: pd.DataFrame,
     """Generate volume-based features."""
     df = df.copy()
     
-    # Volume moving averages
     for period in ma_periods:
         df[f'volume_sma_{period}'] = df['volume'].rolling(window=period).mean()
         df[f'volume_sma_{period}_slope'] = df[f'volume_sma_{period}'].diff()
     
-    # Volume relative to moving average
     df['volume_sma_ratio'] = df['volume'] / df['volume_sma_20']
     
     return df
 
 def generate_target_variables(df: pd.DataFrame, 
-                            horizons: List[int] = [12, 24, 48],  # 1h, 2h, 4h with 5min candles
+                            horizons: List[int] = [12, 24, 48], 
                             threshold: float = 0.001) -> pd.DataFrame:
     """Generate target variables for different prediction horizons."""
     df = df.copy()
     
     for horizon in horizons:
-        # Calculate future returns
         future_price = df['close'].shift(-horizon)
         returns = (future_price - df['close']) / df['close']
-        
-        # Create binary target (1 if return > threshold)
         df[f'target_up_{horizon}p'] = (returns > threshold).astype(int)
         
     return df
@@ -251,29 +298,22 @@ def create_feature_matrix(price_data: pd.DataFrame,
     """Create complete feature matrix combining all data sources."""
     df = price_data.copy()
     
-    # Technical features
     df = generate_technical_features(df)
     df = generate_volume_features(df)
     
-    # Add sentiment features if available
     if sentiment_data is not None:
         df = pd.merge(df, sentiment_data, on='timestamp', how='left')
     
-    # Add social features if available
     if social_data is not None:
         df = pd.merge(df, social_data, on='timestamp', how='left')
     
-    # Generate target variables
     df = generate_target_variables(df)
     
-    # List of feature columns (excluding target variables and timestamp)
     feature_cols = [col for col in df.columns 
                    if not col.startswith('target_') 
                    and col not in ['timestamp', 'symbol']]
     
     return df, feature_cols
-
-# --- Main Feature Generation Function ---
 
 def generate_features_for_symbol(
     symbol: str,
@@ -295,44 +335,59 @@ def generate_features_for_symbol(
     start_time_utc = end_time_utc - history_duration
     
     try:
-        # Fetch price data for the specified interval
-        interval = config.CANDLE_INTERVAL  # e.g., '5m'
+        interval = config.CANDLE_INTERVAL
         log.info(f"Fetching price data for {symbol} from {start_time_utc} to {end_time_utc}")
         price_df = fetch_price_data(engine, symbol, interval, start_time_utc, end_time_utc)
         
-        if price_df.empty:
-            log.warning(f"No price data available for {symbol} in the specified time range")
-            return None
+        if price_df.empty or len(price_df) < PRICE_LAG_PERIODS:
+             log.warning(f"Insufficient price data for {symbol}. Required: {PRICE_LAG_PERIODS}, Found: {len(price_df)}")
+             return None
             
-        # Ensure price data has enough history
-        if len(price_df) < PRICE_LAG_PERIODS:
-            log.warning(f"Insufficient price history for {symbol}: {len(price_df)} rows < {PRICE_LAG_PERIODS} required")
-            return None
-            
-        # Calculate the target variable
         price_df[f'target_up_{PREDICTION_HORIZON}p'] = _calculate_target(price_df, PREDICTION_HORIZON)
         
-        # Generate technical features
         log.debug(f"Generating technical features for {symbol}")
         features_df = generate_technical_features(price_df)
         features_df = generate_volume_features(features_df)
         
-        # Fetch API data
-        log.debug(f"Fetching API data for {symbol}")
-        api_data = _fetch_api_features(engine, symbol.replace('USDT', ''), start_time_utc, end_time_utc)
+        features_df['symbol'] = symbol
         
-        # Add API features
+        log.debug(f"Fetching API data for {symbol}")
+        base_symbol = symbol.replace('USDT', '')
+        api_data = _fetch_api_features(engine, base_symbol, start_time_utc, end_time_utc)
+        
         log.debug(f"Calculating API features for {symbol}")
         features_df = _calculate_api_features(api_data, features_df)
+
+        log.debug(f"Fetching general news/social sentiment data for {symbol}")
+        general_sentiment_df = _fetch_general_sentiment_data(engine, symbol, start_time_utc, end_time_utc)
         
-        # Handle missing values
+        log.debug(f"Calculating general sentiment features for {symbol}")
+        general_sentiment_features = _calculate_general_sentiment_features(general_sentiment_df, features_df.index)
+        
+        features_df = pd.merge(features_df, general_sentiment_features, left_index=True, right_index=True, how='left')
+        log.info(f"Added {len(general_sentiment_features.columns)} general sentiment features for {symbol}")
+
+        is_low_value = False
+        recent_close = price_df['close'].iloc[-1] if not price_df.empty else None
+        if recent_close is not None and recent_close < 1.0:
+            is_low_value = True
+            log.info(f"{symbol} identified as a low-value coin (price: ${recent_close:.4f})")
+            
+            log.debug(f"Fetching low-value coin sentiment data for {base_symbol}")
+            low_value_data = fetch_low_value_coin_sentiment_data(engine, base_symbol, start_time_utc, end_time_utc)
+            
+            log.debug("Fetching cross-coin sentiment metrics")
+            cross_coin_data = fetch_cross_coin_sentiment_metrics(engine, start_time_utc, end_time_utc)
+            
+            log.debug("Calculating low-value coin sentiment features")
+            features_df = _calculate_low_value_coin_features(features_df, low_value_data, cross_coin_data)
+            
+            log.info(f"Added specialized low-value coin sentiment features for {symbol}")
+        
         log.debug(f"Handling missing values")
-        # Forward fill and then backward fill remaining NaNs from technical indicators
-        # Using dict instead of method='ffill' to avoid Pylance type errors
-        features_df = features_df.fillna(method='ffill')  # type: ignore
-        features_df = features_df.fillna(method='bfill')  # type: ignore
+        features_df = features_df.fillna(method='ffill')
+        features_df = features_df.fillna(method='bfill')
         
-        # Drop rows with NaN target (typically the last few rows depending on prediction horizon)
         target_col = f'target_up_{PREDICTION_HORIZON}p'
         features_df = features_df.dropna(subset=[target_col])
         
@@ -340,12 +395,10 @@ def generate_features_for_symbol(
             log.warning(f"After dropping NaNs, feature DataFrame is empty for {symbol}")
             return None
             
-        # Final check for any remaining NaNs in the feature columns
-        if features_df.isnull().values.any():
-            log.warning(f"NaN values detected in features for {symbol}")
-            # If you want to drop rows with any NaN, uncomment:
-            # features_df = features_df.dropna()
-            # Or replace NaNs with default values:
+        if features_df.drop(columns=[target_col], errors='ignore').isnull().values.any():
+            log.warning(f"NaN values still detected in features for {symbol} after fill. Replacing with 0.")
+            nan_cols = features_df.columns[features_df.isnull().any()].tolist()
+            log.warning(f"Columns with NaNs: {nan_cols}")
             features_df = features_df.fillna(0)
             
         log.info(f"Successfully generated {len(features_df)} rows of features for {symbol}")
@@ -358,15 +411,13 @@ def generate_features_for_symbol(
 if __name__ == '__main__':
     import argparse
 
-    # Setup basic logging for direct script run
     logging.basicConfig(level=config.LOG_LEVEL, format='%(asctime)s - %(levelname)s [%(name)s:%(lineno)d] %(message)s')
 
-    # Parse command-line arguments for symbol
     parser = argparse.ArgumentParser(description="Feature Generator for a specific symbol.")
     parser.add_argument('--symbol', type=str, required=True, help="The cryptocurrency symbol (e.g., 'DOGEUSDT').")
     args = parser.parse_args()
 
-    symbol = args.symbol  # Use the symbol provided as an argument
+    symbol = args.symbol
     end_time = datetime.datetime.now(pytz.utc)
     history = pd.Timedelta(days=7)
 

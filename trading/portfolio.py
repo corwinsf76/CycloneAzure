@@ -17,6 +17,83 @@ import config
 
 log = logging.getLogger(__name__)
 
+class Portfolio:
+    """
+    Simple interface to track and manage a trading portfolio.
+    This class is used by the dashboard to display portfolio information.
+    """
+    
+    def __init__(self, initial_capital: float = config.INITIAL_CAPITAL_USD):
+        """
+        Initialize a new Portfolio with the given capital.
+        
+        Args:
+            initial_capital: Starting cash balance in USD
+        """
+        self.manager = PortfolioManager(initial_capital=initial_capital)
+        
+    def get_value(self, current_prices: Dict[str, float]) -> float:
+        """
+        Get the current total portfolio value.
+        
+        Args:
+            current_prices: Dictionary mapping symbols to their current prices
+            
+        Returns:
+            Total portfolio value in USD
+        """
+        return self.manager.calculate_total_value(current_prices)
+        
+    def get_positions(self) -> Dict[str, Dict]:
+        """
+        Get all current positions in the portfolio.
+        
+        Returns:
+            Dictionary of positions by symbol
+        """
+        return self.manager.get_all_positions()
+        
+    def get_cash(self) -> float:
+        """
+        Get available cash in the portfolio.
+        
+        Returns:
+            Available cash in USD
+        """
+        return self.manager.get_available_capital()
+        
+    def get_performance(self) -> Dict[str, float]:
+        """
+        Get portfolio performance metrics.
+        
+        Returns:
+            Dictionary with performance metrics like total_value, cash, 
+            initial_capital, and drawdown_percentage
+        """
+        drawdown = 0
+        if self.manager.peak_value > 0:
+            drawdown = (self.manager.peak_value - self.manager.total_value) / self.manager.peak_value
+            
+        return {
+            'total_value': self.manager.total_value,
+            'cash': self.manager.cash,
+            'initial_capital': self.manager.initial_capital,
+            'drawdown_percentage': drawdown,
+            'is_trading_halted': self.manager.halt_trading_flag
+        }
+        
+    def add_transaction(self, symbol: str, quantity: float, price: float):
+        """
+        Add a transaction to the portfolio.
+        
+        Args:
+            symbol: Symbol being traded (e.g., 'BTCUSDT')
+            quantity: Quantity traded (positive for buy, negative for sell)
+            price: Price at which the trade was executed
+        """
+        self.manager.update_position(symbol, quantity, price, pd.Timestamp.now(tz=pytz.utc))
+
+
 class PortfolioManager:
     """
     Manages the state of the trading portfolio (cash, positions, value).

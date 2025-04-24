@@ -1,0 +1,18 @@
+{
+  "operation_name": "complete_backfill_process",
+  "start_time": "2025-04-23T05:48:59.640831+00:00",
+  "end_time": "2025-04-23T05:58:24.477941+00:00",
+  "duration_seconds": 564.8371107578278,
+  "items_processed": 0,
+  "items_skipped": 0,
+  "items_failed": 0,
+  "success_rate": 0,
+  "api_calls": 0,
+  "api_errors": 0,
+  "api_error_rate": 0,
+  "rate_limit_hits": 0,
+  "db_inserts": 0,
+  "db_errors": 0,
+  "avg_processing_time": null,
+  "symbols_count": 7
+}

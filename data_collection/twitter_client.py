@@ -1,274 +1,648 @@
 # /data_collection/twitter_client.py
 
 import logging
-import tweepy
 import datetime
 import pytz
 from typing import List, Dict, Optional, Tuple, Any
-import time
-import json # Added for JSON serialization if needed
-import os
+import asyncio
+import aiohttp
 import pickle
+import os
+import json
 
-# Use absolute imports assuming 'cyclonev2' is the project root added to PYTHONPATH
 import config
-# from .. import config # Use relative import if running as part of a package
+from database.db_utils import async_bulk_insert
+from data_collection.binance_client import get_target_symbols
+from data_collection.coingecko_client import fetch_coin_prices, get_coin_id
 
 log = logging.getLogger(__name__)
 
-# Custom exception classes
-class RateLimitError(Exception):
-    """Exception raised when a rate limit is exceeded."""
-    pass
-
-# File to persist since_id for polling
 SINCE_ID_FILE = "twitter_since_id.pkl"
 
-def save_since_id(query_key: str, since_id: str):
+async def save_since_id(query_key: str, since_id: str):
     """Saves the since_id for a specific query to a file."""
     try:
+        existing_data = {}
         if os.path.exists(SINCE_ID_FILE):
-            with open(SINCE_ID_FILE, "rb") as f:
-                since_id_store = pickle.load(f)
-        else:
-            since_id_store = {}
-
-        since_id_store[query_key] = since_id
-
-        with open(SINCE_ID_FILE, "wb") as f:
-            pickle.dump(since_id_store, f)
-        log.info(f"Saved since_id for query '{query_key}': {since_id}")
+            with open(SINCE_ID_FILE, 'rb') as f:
+                existing_data = pickle.load(f)
+        existing_data[query_key] = since_id
+        with open(SINCE_ID_FILE, 'wb') as f:
+            pickle.dump(existing_data, f)
     except Exception as e:
-        log.error(f"Error saving since_id: {e}", exc_info=True)
+        log.error(f"Error saving since_id: {e}")
 
-def load_since_id(query_key: str) -> Optional[str]:
+async def load_since_id(query_key: str) -> Optional[str]:
     """Loads the since_id for a specific query from a file."""
     try:
         if os.path.exists(SINCE_ID_FILE):
-            with open(SINCE_ID_FILE, "rb") as f:
-                since_id_store = pickle.load(f)
-            return since_id_store.get(query_key)
+            with open(SINCE_ID_FILE, 'rb') as f:
+                data = pickle.load(f)
+                return data.get(query_key)
     except Exception as e:
-        log.error(f"Error loading since_id: {e}", exc_info=True)
+        log.error(f"Error loading since_id: {e}")
     return None
 
-def split_query(query: str, max_length: int = 512) -> List[str]:
-    """Splits a long query into smaller parts to fit within the Twitter API limit."""
-    if len(query) <= max_length:
-        return [query]
-
-    terms = query.split(" OR ")
-    queries = []
-    current_query = ""
-
-    for term in terms:
-        if len(current_query) + len(term) + 4 <= max_length:  # +4 for " OR "
-            current_query = f"{current_query} OR {term}" if current_query else term
-        else:
-            queries.append(current_query)
-            current_query = term
-
-    if current_query:
-        queries.append(current_query)
-
-    return queries
-
-# --- Twitter Client Initialization ---
-_twitter_client_v2 = None
-
-def get_twitter_client_v2():
-    """Initializes and returns the Tweepy API v2 client singleton."""
-    global _twitter_client_v2
-    if _twitter_client_v2 is None:
-        bearer_token = config.TWITTER_BEARER_TOKEN
-        if not bearer_token:
-            log.error("Twitter API v2 Bearer Token (TWITTER_BEARER_TOKEN) not configured.")
-            return None
-        try:
-            log.info("Initializing Tweepy client for Twitter API v2...")
-            # Use bearer token for app-only authentication (suitable for searching tweets)
-            _twitter_client_v2 = tweepy.Client(bearer_token=bearer_token, wait_on_rate_limit=False) # Handle rate limits manually for logging
-            log.info("Tweepy client object created successfully (using Bearer Token).")
-
-        except tweepy.TweepyException as e:
-            log.error(f"TweepyException initializing Twitter client: {e}", exc_info=True)
-            _twitter_client_v2 = None
-        except Exception as e:
-            log.error(f"Unexpected error initializing Twitter client: {e}", exc_info=True)
-            _twitter_client_v2 = None
-    return _twitter_client_v2
-
-def build_twitter_query(symbols: List[str], base_keywords: List[str] = config.TWITTER_QUERY_KEYWORDS) -> str:
-    """
-    Builds a search query string for the Twitter API v2 Recent Search endpoint.
-    Focuses on hashtags for the given symbols, combined with base keywords.
-    Excludes retweets and requires English language.
-
-    Args:
-        symbols (List[str]): List of cryptocurrency symbols (e.g., ['BTC', 'ETH']).
-                             Should be just the base symbol, without 'USDT'.
-        base_keywords (List[str]): General keywords to include (e.g., ['crypto']).
-
-    Returns:
-        str: A formatted query string for the Twitter API.
-             Returns an empty string if no symbols or keywords provided.
-    """
-    if not symbols and not base_keywords:
-        log.warning("Cannot build Twitter query without symbols or keywords.")
+def build_twitter_query(symbols: List[str], base_keywords: Optional[List[str]] = None) -> str:
+    """Build a Twitter search query from symbols and keywords."""
+    if not symbols:
         return ""
+    
+    # Use default keywords if none provided
+    keywords = base_keywords or ["crypto", "price", "market"]
+    
+    # Build query components
+    symbol_terms = [f"(${symbol} OR #{symbol})" for symbol in symbols]
+    keyword_terms = [f"({keyword})" for keyword in keywords]
+    
+    # Combine with OR between symbols and AND between keywords
+    query = f"({' OR '.join(symbol_terms)}) ({' OR '.join(keyword_terms)})"
+    return query
 
-    symbol_query_parts = []
-    if symbols:
-        # Create hashtag parts for each symbol
-        symbol_parts = []
-        for symbol in symbols:
-            s_upper = symbol.upper().replace('USDT', '').replace('BUSD','') # Ensure base symbol, uppercase
-            if s_upper:
-                # --- Modified: Removed the cashtag ($SYMBOL) part ---
-                symbol_parts.append(f"#{s_upper}")
-        if symbol_parts:
-            # Keep the OR structure between hashtags
-            symbol_query_parts.append(f"({' OR '.join(symbol_parts)})")
+def build_user_query(usernames: List[str]) -> str:
+    """Build a Twitter search query to fetch tweets from specific users."""
+    if not usernames:
+        return ""
+    
+    # Build query components for each username
+    user_terms = [f"from:{username}" for username in usernames]
+    
+    # Combine with OR between usernames
+    query = f"{' OR '.join(user_terms)}"
+    return query
 
-    keyword_query_parts = []
-    if base_keywords:
-        keyword_part = " ".join([f'"{k}"' if ' ' in k else k for k in base_keywords]) # Quote keywords with spaces
-        keyword_query_parts.append(f"({keyword_part})")
-
-    # Combine symbol and keyword parts (if both exist, combine with OR or AND depending on need - using OR for broader reach)
-    combined_terms = " OR ".join(symbol_query_parts + keyword_query_parts)
-    if not combined_terms:
-         log.warning("No valid symbols or keywords resulted in query terms.")
-         return ""
-
-    # Combine parts, add language filter and exclude retweets
-    full_query = f"({combined_terms}) lang:en -is:retweet"
-
-    # Twitter query length limit is 512 chars for standard v2 basic/elevated, 1024 for academic
-    max_len = 512
-    if len(full_query) > max_len:
-        log.warning(f"Generated Twitter query exceeds max length ({max_len}). Truncating: {full_query}")
-        # Simple truncation, might break logic. Consider smarter query splitting if this happens often.
-        full_query = full_query[:max_len].rsplit(' ', 1)[0] # Try to cut at last space
-        log.warning(f"Truncated query: {full_query}")
-
-    log.debug(f"Generated Twitter Query: {full_query}")
-    return full_query.strip()
-
-
-def search_recent_tweets(query: str, since_id: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """Search for recent tweets."""
-    client = get_twitter_client_v2()
-    if not client:
-        log.error("Cannot search tweets, Twitter client not available.")
+async def search_recent_tweets(
+    query: str,
+    since_id: Optional[str] = None,
+    max_total_results: int = 100,
+    results_per_page: int = 10
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    Search recent tweets using Twitter API v2.
+    Returns tuple of (tweets_list, newest_id).
+    """
+    if not config.TWITTER_BEARER_TOKEN:
+        log.error("Twitter Bearer Token not configured")
         return [], None
 
-    fetched_tweets = []
-    current_newest: Optional[str] = None
-    next_page_token = None
-    page_num = 0
+    base_url = "https://api.twitter.com/2/tweets/search/recent"
+    headers = {"Authorization": f"Bearer {config.TWITTER_BEARER_TOKEN}"}
+    
+    # Request tweet fields we need
+    tweet_fields = "created_at,public_metrics,entities"
+    
+    all_tweets = []
+    newest_id = None
+    pagination_token = None
+    remaining_results = max_total_results
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            while remaining_results > 0:
+                params = {
+                    "query": query,
+                    "max_results": min(results_per_page, remaining_results),
+                    "tweet.fields": tweet_fields,
+                }
+                
+                if since_id:
+                    params["since_id"] = since_id
+                if pagination_token:
+                    params["pagination_token"] = pagination_token
+
+                async with session.get(base_url, headers=headers, params=params) as response:
+                    if response.status != 200:
+                        log.error(f"Twitter API error: {response.status}")
+                        break
+
+                    data = await response.json()
+                    tweets = data.get("data", [])
+                    
+                    if not tweets:
+                        break
+                        
+                    # Update newest_id from first tweet of first page
+                    if not newest_id and tweets:
+                        newest_id = tweets[0]["id"]
+                    
+                    # Process tweets
+                    for tweet in tweets:
+                        processed_tweet = {
+                            'tweet_id': tweet['id'],
+                            'text': tweet['text'],
+                            'created_at': datetime.datetime.fromisoformat(tweet['created_at'].replace('Z', '+00:00')),
+                            'public_metrics': tweet.get('public_metrics', {}),
+                            'hashtags': [tag['tag'] for tag in tweet.get('entities', {}).get('hashtags', [])],
+                            'cashtags': [tag['tag'] for tag in tweet.get('entities', {}).get('cashtags', [])],
+                            'fetched_at': datetime.datetime.now(pytz.utc)
+                        }
+                        all_tweets.append(processed_tweet)
+                    
+                    # Check for more pages
+                    meta = data.get("meta", {})
+                    if "next_token" not in meta:
+                        break
+                    
+                    pagination_token = meta["next_token"]
+                    remaining_results -= len(tweets)
+                    
+                    # Add small delay between requests
+                    await asyncio.sleep(1)
+
+    except Exception as e:
+        log.error(f"Error fetching tweets: {e}", exc_info=True)
+        return [], None
+
+    # Store tweets in database
+    if all_tweets:
+        try:
+            await async_bulk_insert(all_tweets, 'twitter_data')
+        except Exception as e:
+            log.error(f"Error storing tweets in database: {e}")
+
+    return all_tweets, newest_id
+
+async def fetch_new_tweets(symbols: List[str], base_keywords: Optional[List[str]] = None) -> List[Dict]:
+    """
+    Fetch new tweets for given symbols, using since_id to avoid duplicates.
+    Returns list of processed tweets.
+    """
+    query = build_twitter_query(symbols, base_keywords)
+    if not query:
+        return []
+
+    query_key = '_'.join(sorted(symbols))
+    since_id = await load_since_id(query_key)
+    
+    tweets, newest_id = await search_recent_tweets(
+        query=query,
+        since_id=since_id,
+        max_total_results=config.TWITTER_FETCH_LIMIT
+    )
+    
+    if newest_id:
+        await save_since_id(query_key, newest_id)
+    
+    return tweets
+
+async def fetch_influencer_tweets(batch_size: int = 15) -> List[Dict]:
+    """
+    Fetch tweets from crypto influencers defined in config.
+    Twitter API has query limits, so we process influencers in batches.
+    
+    Args:
+        batch_size: Number of influencers to include in a single API query
+        
+    Returns:
+        List of processed tweets from influencers
+    """
+    if not config.TWITTER_INFLUENCERS:
+        log.warning("No Twitter influencers configured, skipping influencer tweet collection")
+        return []
+        
+    all_tweets = []
+    
+    # Process influencers in batches to respect Twitter query complexity limits
+    influencer_batches = [
+        config.TWITTER_INFLUENCERS[i:i + batch_size] 
+        for i in range(0, len(config.TWITTER_INFLUENCERS), batch_size)
+    ]
+    
+    log.info(f"Fetching tweets from {len(config.TWITTER_INFLUENCERS)} influencers in {len(influencer_batches)} batches")
+    
+    for batch_idx, influencer_batch in enumerate(influencer_batches):
+        # Create a unique key for this batch to track since_id
+        batch_key = f"influencers_batch_{batch_idx}"
+        
+        # Build query for this batch of influencers
+        query = build_user_query(influencer_batch)
+        since_id = await load_since_id(batch_key)
+        
+        log.debug(f"Fetching tweets from influencer batch {batch_idx+1}/{len(influencer_batches)}")
+        
+        batch_tweets, newest_id = await search_recent_tweets(
+            query=query,
+            since_id=since_id,
+            max_total_results=config.TWITTER_FETCH_LIMIT
+        )
+        
+        if newest_id:
+            await save_since_id(batch_key, newest_id)
+            
+        # Add batch tweets to overall results
+        all_tweets.extend(batch_tweets)
+        
+        # Add a delay to respect rate limits
+        if batch_idx < len(influencer_batches) - 1:  # Don't delay after the last batch
+            await asyncio.sleep(2)
+    
+    log.info(f"Fetched {len(all_tweets)} total tweets from crypto influencers")
+    return all_tweets
+
+async def fetch_low_value_coin_tweets_from_influencers(max_batches: int = 5) -> List[Dict]:
+    """
+    Fetch tweets from crypto influencers specifically about low-value coins (< $1).
+    
+    This specialized function:
+    1. Gets current Binance symbols and filters for coins valued under $1
+    2. Generates comprehensive search terms for each coin (symbol, name, variations)
+    3. Searches tweets from the configured influencers matching these coins
+    4. Groups influencers in batches to respect Twitter API limits
+    
+    Args:
+        max_batches: Maximum number of influencer batches to process (limit API usage)
+        
+    Returns:
+        List of processed tweets about low-value coins from influencers
+    """
+    if not config.TWITTER_INFLUENCERS:
+        log.warning("No Twitter influencers configured, skipping collection")
+        return []
+    
+    all_tweets = []
     
     try:
-        while True:
-            response = client.search_recent_tweets(
-                query=query,
-                since_id=since_id,
-                next_token=next_page_token
-            )
-            
-            if hasattr(response, 'errors') and getattr(response, 'errors'):
-                log.error(f"Twitter API returned errors on page {page_num + 1}: {getattr(response, 'errors')}")
-                for error in getattr(response, 'errors'):
-                    if error.get('code') == 88:  # Rate limit error
-                        raise RateLimitError(error.get('message', 'Rate limit exceeded'))
-                break
-            
-            if hasattr(response, 'data') and getattr(response, 'data'):
-                tweets_data = getattr(response, 'data')
-                log.info(f"Received {len(tweets_data)} tweets on page {page_num + 1}.")
-                fetched_tweets.extend(tweets_data)
-                
-                # Track newest_id for incrementally fetching newer tweets
-                meta = getattr(response, 'meta', {})
-                if meta and 'newest_id' in meta:
-                    current_newest = meta['newest_id']
-                
-                if meta and 'next_token' in meta:
-                    next_page_token = meta['next_token']
-                    page_num += 1
-                else:
-                    break  # No more pages
-            else:
-                break  # No data in response
-                
-    except tweepy.TweepyException as e:
-        if isinstance(e, tweepy.BadRequest):
-            log.error(f"Bad request error: {str(e)}")
-        elif isinstance(e, tweepy.HTTPException) and hasattr(e, 'response') and e.response is not None and e.response.status_code == 429:
-            log.error("Rate limit exceeded")
-            raise RateLimitError("Twitter API rate limit exceeded")
-        else:
-            log.error(f"Twitter API error: {str(e)}")
-        raise
+        # Step 1: Get all Binance symbols and filter for coins under $1
+        target_symbols_usdt = await get_target_symbols()
+        if not target_symbols_usdt:
+            log.error("Failed to get target symbols from Binance")
+            return []
         
-    return fetched_tweets, current_newest
-
-
-# --- Example Usage (for testing) ---
-# Store the last fetched tweet ID for pagination testing
-# In a real app, this state needs to be persisted (e.g., in DB or a state file)
-_LATEST_TWEET_ID_STORE_TEST = {}
-
-if __name__ == '__main__':
-    # Setup basic logging for direct script run
-    logging.basicConfig(level=config.LOG_LEVEL, format='%(asctime)s - %(levelname)s [%(name)s:%(lineno)d] %(message)s')
-
-    print("--- Testing Twitter Client ---")
-
-    if not config.TWITTER_BEARER_TOKEN:
-         print("\nERROR: Twitter Bearer Token (TWITTER_BEARER_TOKEN) not configured in .env")
-    else:
-        # Test with a few symbols
-        test_symbols = ['BTC', 'ETH'] # Use symbols likely to have recent tweets
-        test_query = build_twitter_query(symbols=test_symbols, base_keywords=['price']) # Uses the corrected build_twitter_query
-
-        if test_query:
-            print(f"\nGenerated Query (No Cashtags): {test_query}")
-
-            # --- Simulate polling with since_id ---
-            query_key_test = "test_btc_eth_no_cashtag"
-            # 1. First fetch
-            print("\n--- Fetch 1 (No Since ID) ---")
-            since_id_for_run = load_since_id(query_key_test) # Load since_id from file
-            tweets1, newest_id1 = search_recent_tweets(query=test_query, since_id=since_id_for_run) # Fetch tweets
-            if tweets1:
-                print(f"Fetched {len(tweets1)} tweets.")
-                print("First tweet:", tweets1[0]['text'][:100] + "...")
-                print(f"Newest ID: {newest_id1}")
-                if newest_id1:
-                     save_since_id(query_key_test, newest_id1) # Save since_id to file
-            else:
-                print("No new tweets found in Fetch 1.")
-
-            # Add a small delay before next fetch if testing pagination
-            print("\nWaiting 5 seconds...")
-            time.sleep(5)
-
-            # 2. Second fetch (should ideally fetch 0 if no new tweets in 5s)
-            print("\n--- Fetch 2 (Using Since ID from Fetch 1) ---")
-            since_id_for_run = load_since_id(query_key_test) # Load since_id from file
-            print(f"Using since_id: {since_id_for_run}")
-            # Pass since_id correctly to search_recent_tweets
-            tweets2, newest_id2 = search_recent_tweets(query=test_query, since_id=since_id_for_run)
-            if tweets2:
-                print(f"Fetched {len(tweets2)} tweets.") # Should likely be 0 or very few
-                if newest_id2:
-                     save_since_id(query_key_test, newest_id2) # Save since_id to file
-            else:
-                print("No new tweets found in Fetch 2 (as expected potentially).")
-                print(f"Newest ID from Fetch 2 meta (if any): {newest_id2}") # newest_id_overall is returned
-
+        log.info(f"Retrieved {len(target_symbols_usdt)} target symbols from Binance")
+        
+        # Extract base symbols
+        base_symbols_upper = list(set([s.replace('USDT', '').upper() for s in target_symbols_usdt]))
+        log.info(f"Extracted {len(base_symbols_upper)} unique base symbols")
+        
+        # Fetch current prices to filter coins valued at less than $1
+        log.info("Fetching coin prices to filter by value...")
+        coin_prices = await fetch_coin_prices(base_symbols_upper)
+        
+        # Filter symbols to only include coins valued at less than $1
+        low_value_symbols = [symbol for symbol, price in coin_prices.items() if price < 1.0]
+        
+        if not low_value_symbols:
+            log.warning("No coins valued at less than $1 found")
+            return []
+        
+        log.info(f"Found {len(low_value_symbols)} coins valued under $1: {', '.join(low_value_symbols)}")
+        
+        # Step 2: Get coin names and variations for more comprehensive search
+        # Create mapping of symbol to coin name for richer search terms
+        coin_name_mapping = {}
+        coin_ids = {}
+        
+        # Use rate limiter for CoinGecko API calls
+        rate_limiter = AsyncRateLimiter(config.COINGECKO_CALLS_PER_MINUTE)
+        
+        # Get coin info in batches to avoid rate limiting
+        batch_size = 5
+        symbol_batches = [low_value_symbols[i:i+batch_size] for i in range(0, len(low_value_symbols), batch_size)]
+        
+        for batch in symbol_batches:
+            for symbol in batch:
+                try:
+                    await rate_limiter.wait_if_needed()
+                    
+                    # Get coin ID first
+                    coin_id = await get_coin_id(symbol.lower())
+                    if coin_id:
+                        coin_ids[symbol] = coin_id
+                        
+                        # Make another API call to get full coin info including name
+                        async with aiohttp.ClientSession() as session:
+                            url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+                            params = {'localization': 'false', 'tickers': 'false', 'market_data': 'false'}
+                            
+                            headers = {}
+                            if hasattr(config, 'COINGECKO_API_KEY') and config.COINGECKO_API_KEY:
+                                headers['x-cg-pro-api-key'] = config.COINGECKO_API_KEY
+                            
+                            async with session.get(url, params=params, headers=headers) as response:
+                                if response.status == 200:
+                                    data = await response.json()
+                                    name = data.get('name', '')
+                                    if name:
+                                        coin_name_mapping[symbol] = name
+                                        log.debug(f"Mapped {symbol} to name: {name}")
+                                else:
+                                    log.warning(f"Failed to get coin info for {symbol}: HTTP {response.status}")
+                    else:
+                        log.warning(f"Could not find CoinGecko ID for {symbol}")
+                except Exception as e:
+                    log.error(f"Error getting coin info for {symbol}: {e}")
+            
+            # Add delay between batches
+            await asyncio.sleep(2)
+        
+        if not coin_name_mapping:
+            log.warning("Could not map any coin symbols to names")
         else:
-            print("Could not generate a valid test query.")
+            log.info(f"Mapped {len(coin_name_mapping)} symbols to their full names")
+        
+        # Step 3: Process influencers in batches
+        # Smaller batch size for influencers due to Twitter query complexity limits
+        influencer_batch_size = 5
+        influencer_batches = [
+            config.TWITTER_INFLUENCERS[i:i+influencer_batch_size]
+            for i in range(0, len(config.TWITTER_INFLUENCERS), influencer_batch_size)
+        ]
+        
+        # Limit the number of batches processed if requested
+        if max_batches and max_batches > 0:
+            influencer_batches = influencer_batches[:max_batches]
+            log.info(f"Limited to first {max_batches} batches of influencers ({min(max_batches * influencer_batch_size, len(config.TWITTER_INFLUENCERS))} total influencers)")
+        
+        log.info(f"Processing {len(influencer_batches)} batches of influencers")
+        
+        # Process each batch of influencers
+        for batch_idx, influencer_batch in enumerate(influencer_batches):
+            batch_key = f"low_value_influencers_batch_{batch_idx}"
+            since_id = await load_since_id(batch_key)
+            
+            # Create user query for this batch of influencers
+            users_query = build_user_query(influencer_batch)
+            
+            # Process each coin separately for this batch of influencers
+            for symbol in low_value_symbols:
+                coin_name = coin_name_mapping.get(symbol, '')
+                
+                # Build search terms for this coin (symbol, name, variations)
+                search_terms = []
+                
+                # Add symbol variations (with $ cashtag, # hashtag, and plain)
+                search_terms.append(f"${symbol}")
+                search_terms.append(f"#{symbol}")
+                search_terms.append(symbol)
+                
+                # Add full name if available (with # hashtag and plain)
+                if coin_name:
+                    search_terms.append(f"#{coin_name}")
+                    search_terms.append(coin_name)
+                    
+                    # Add name without spaces for hashtags
+                    no_space_name = coin_name.replace(" ", "")
+                    if no_space_name != coin_name:
+                        search_terms.append(f"#{no_space_name}")
+                
+                # Combine all search terms with OR
+                coin_query = f"({' OR '.join(search_terms)})"
+                
+                # Combine user query and coin query
+                query = f"{users_query} {coin_query}"
+                log.debug(f"Searching for: {query}")
+                
+                try:
+                    tweets, newest_id = await search_recent_tweets(
+                        query=query,
+                        since_id=since_id,
+                        max_total_results=config.TWITTER_FETCH_LIMIT
+                    )
+                    
+                    if tweets:
+                        log.info(f"Found {len(tweets)} tweets about {symbol} ({coin_name}) from batch {batch_idx+1} influencers")
+                        
+                        # Enhance tweet metadata with coin info
+                        for tweet in tweets:
+                            tweet['coin_symbol'] = symbol
+                            tweet['coin_name'] = coin_name
+                            tweet['coin_price'] = coin_prices.get(symbol, 0)
+                        
+                        all_tweets.extend(tweets)
+                    else:
+                        log.debug(f"No tweets found about {symbol} from batch {batch_idx+1} influencers")
+                    
+                    # Update since_id for this batch if needed
+                    if newest_id and (not since_id or newest_id > since_id):
+                        since_id = newest_id
+                    
+                    # Small delay between coin queries
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    log.error(f"Error searching tweets for {symbol} from batch {batch_idx+1}: {e}")
+            
+            # Save the latest since_id for this batch
+            if since_id:
+                await save_since_id(batch_key, since_id)
+            
+            # Delay between influencer batches
+            if batch_idx < len(influencer_batches) - 1:
+                await asyncio.sleep(3)
+        
+        log.info(f"Found a total of {len(all_tweets)} tweets about coins under $1 from the configured influencers")
+        
+    except Exception as e:
+        log.error(f"Error in fetch_low_value_coin_tweets_from_influencers: {e}", exc_info=True)
+    
+    return all_tweets
 
-    print("\n--- Test Complete ---")
+async def fetch_all_low_value_coin_tweets(batch_size: int = 5) -> List[Dict]:
+    """
+    Fetch tweets from all Twitter users about cryptocurrencies valued under $1.
+    
+    This specialized function:
+    1. Gets current Binance symbols and filters for coins valued under $1
+    2. Generates comprehensive search terms for each coin (symbol, name, variations)
+    3. Searches all public tweets mentioning these low-value coins
+    4. Processes coins in batches to respect Twitter API limits
+    
+    Args:
+        batch_size: Number of coins to process in each batch (to manage API usage)
+        
+    Returns:
+        List of processed tweets about low-value coins from all users
+    """
+    all_tweets = []
+    
+    try:
+        # Step 1: Get all Binance symbols and filter for coins under $1
+        target_symbols_usdt = await get_target_symbols()
+        if not target_symbols_usdt:
+            log.error("Failed to get target symbols from Binance")
+            return []
+        
+        log.info(f"Retrieved {len(target_symbols_usdt)} target symbols from Binance")
+        
+        # Extract base symbols
+        base_symbols_upper = list(set([s.replace('USDT', '').upper() for s in target_symbols_usdt]))
+        log.info(f"Extracted {len(base_symbols_upper)} unique base symbols")
+        
+        # Fetch current prices to filter coins valued at less than $1
+        log.info("Fetching coin prices to filter by value...")
+        coin_prices = await fetch_coin_prices(base_symbols_upper)
+        
+        # Filter symbols to only include coins valued at less than $1
+        low_value_symbols = [symbol for symbol, price in coin_prices.items() if price < 1.0]
+        
+        if not low_value_symbols:
+            log.warning("No coins valued at less than $1 found")
+            return []
+        
+        log.info(f"Found {len(low_value_symbols)} coins valued under $1: {', '.join(low_value_symbols)}")
+        
+        # Step 2: Get coin names and variations for more comprehensive search
+        # Create mapping of symbol to coin name for richer search terms
+        coin_name_mapping = {}
+        coin_ids = {}
+        
+        # Use rate limiter for CoinGecko API calls
+        rate_limiter = AsyncRateLimiter(config.COINGECKO_CALLS_PER_MINUTE)
+        
+        # Get coin info in batches to avoid rate limiting
+        symbol_batches = [low_value_symbols[i:i+batch_size] for i in range(0, len(low_value_symbols), batch_size)]
+        
+        for batch in symbol_batches:
+            for symbol in batch:
+                try:
+                    await rate_limiter.wait_if_needed()
+                    
+                    # Get coin ID first
+                    coin_id = await get_coin_id(symbol.lower())
+                    if coin_id:
+                        coin_ids[symbol] = coin_id
+                        
+                        # Make another API call to get full coin info including name
+                        async with aiohttp.ClientSession() as session:
+                            url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+                            params = {'localization': 'false', 'tickers': 'false', 'market_data': 'false'}
+                            
+                            headers = {}
+                            if hasattr(config, 'COINGECKO_API_KEY') and config.COINGECKO_API_KEY:
+                                headers['x-cg-pro-api-key'] = config.COINGECKO_API_KEY
+                            
+                            async with session.get(url, params=params, headers=headers) as response:
+                                if response.status == 200:
+                                    data = await response.json()
+                                    name = data.get('name', '')
+                                    if name:
+                                        coin_name_mapping[symbol] = name
+                                        log.debug(f"Mapped {symbol} to name: {name}")
+                                else:
+                                    log.warning(f"Failed to get coin info for {symbol}: HTTP {response.status}")
+                    else:
+                        log.warning(f"Could not find CoinGecko ID for {symbol}")
+                except Exception as e:
+                    log.error(f"Error getting coin info for {symbol}: {e}")
+            
+            # Add delay between batches
+            await asyncio.sleep(2)
+        
+        if not coin_name_mapping:
+            log.warning("Could not map any coin symbols to names")
+        else:
+            log.info(f"Mapped {len(coin_name_mapping)} symbols to their full names")
+        
+        # Step 3: Process each low-value coin
+        for symbol in low_value_symbols:
+            coin_name = coin_name_mapping.get(symbol, '')
+            query_key = f"low_value_coin_{symbol.lower()}"
+            since_id = await load_since_id(query_key)
+            
+            # Build search terms for this coin (symbol, name, variations)
+            search_terms = []
+            
+            # Add symbol variations (with $ cashtag, # hashtag, and plain)
+            search_terms.append(f"${symbol}")
+            search_terms.append(f"#{symbol}")
+            search_terms.append(symbol)
+            
+            # Add full name if available (with # hashtag and plain)
+            if coin_name:
+                search_terms.append(f"#{coin_name}")
+                search_terms.append(coin_name)
+                
+                # Add name without spaces for hashtags
+                no_space_name = coin_name.replace(" ", "")
+                if no_space_name != coin_name:
+                    search_terms.append(f"#{no_space_name}")
+            
+            # Combine all search terms with OR
+            query = f"{' OR '.join(search_terms)}"
+            log.debug(f"Searching for: {query}")
+            
+            try:
+                tweets, newest_id = await search_recent_tweets(
+                    query=query,
+                    since_id=since_id,
+                    max_total_results=config.TWITTER_FETCH_LIMIT
+                )
+                
+                if tweets:
+                    log.info(f"Found {len(tweets)} tweets about {symbol} ({coin_name})")
+                    
+                    # Enhance tweet metadata with coin info
+                    for tweet in tweets:
+                        tweet['coin_symbol'] = symbol
+                        tweet['coin_name'] = coin_name
+                        tweet['coin_price'] = coin_prices.get(symbol, 0)
+                    
+                    all_tweets.extend(tweets)
+                else:
+                    log.debug(f"No tweets found about {symbol}")
+                
+                # Update since_id for this coin
+                if newest_id:
+                    await save_since_id(query_key, newest_id)
+                
+                # Small delay between coin searches
+                await asyncio.sleep(1)
+            except Exception as e:
+                log.error(f"Error searching tweets for {symbol}: {e}")
+        
+        log.info(f"Found a total of {len(all_tweets)} tweets about coins under $1")
+        
+    except Exception as e:
+        log.error(f"Error in fetch_all_low_value_coin_tweets: {e}", exc_info=True)
+    
+    return all_tweets
+
+async def fetch_tweets(
+    query: str,
+    start_time: Optional[datetime.datetime] = None,
+    end_time: Optional[datetime.datetime] = None,
+    limit: int = 50
+) -> List[Dict[str, Any]]:
+    """
+    Fetch tweets for a specific query for the dashboard.
+    
+    Args:
+        query: Search query (e.g., "#BTC OR $BTC")
+        start_time: Start time for tweet search
+        end_time: End time for tweet search
+        limit: Maximum number of tweets to fetch
+        
+    Returns:
+        List of tweet objects
+    """
+    try:
+        log.info(f"Fetching tweets for query: {query}")
+        
+        # Convert start/end times to Twitter API format if provided
+        since_id = None
+        
+        # Search for tweets
+        tweets, _ = await search_recent_tweets(
+            query=query,
+            since_id=since_id,
+            max_total_results=limit
+        )
+        
+        # Filter by date if needed
+        if start_time:
+            tweets = [
+                tweet for tweet in tweets 
+                if tweet['created_at'] >= start_time
+            ]
+            
+        if end_time:
+            tweets = [
+                tweet for tweet in tweets 
+                if tweet['created_at'] <= end_time
+            ]
+        
+        log.info(f"Found {len(tweets)} tweets matching query: {query}")
+        return tweets
+        
+    except Exception as e:
+        log.error(f"Error fetching tweets for query {query}: {e}")
+        return []

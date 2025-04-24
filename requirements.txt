@@ -12,12 +12,15 @@
     sqlalchemy>=2.0.0 # Use modern SQLAlchemy
     # psycopg2-binary # Commented out - Not needed for Azure SQL
     pyodbc # Uncommented - Needed for Azure SQL/MS SQL Server
+    asyncpg>=0.30.0 # Added - Needed for async PostgreSQL connections
+    psycopg2-binary>=2.9.9 # Added - Needed for PostgreSQL connections
 
     # --- APIs ---
     python-binance>=1.0.17 # For Binance API
     pandas-ta # For Technical Indicators
     # cryptonews-api # Removed - No specific library found, using 'requests'
     praw>=7.7.0 # For Reddit API
+    asyncpraw>=7.7.0 # Added - Async version of PRAW for Reddit API
     tweepy>=4.14.0 # For Twitter API v2
     python-decouple>=3.8
     aiohttp>=3.9.1
@@ -35,6 +38,8 @@
     dash>=3.0.0
     plotly>=6.0.0
     dash-bootstrap-components>=2.0.0 # For better dashboard layout/styling
+    quart>=0.18.4 # Added - Required for async dashboard support
+    hypercorn>=0.16.0 # Added - ASGI server for Quart
 
     # --- Utilities ---
     # Add any other utility libraries needed

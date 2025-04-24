@@ -1,0 +1,442 @@
+# /database/db_utils.py
+
+"""
+Database Utility Module
+
+This module provides utility functions and table definitions for interacting with the database.
+Now optimized for PostgreSQL with proper async support.
+
+Functions:
+    init_db: Initializes database tables if they don't exist.
+    get_db_session: Provides a context manager for database sessions.
+    bulk_insert_data: Inserts data into a table with optional duplicate checks.
+    df_to_db: Writes a Pandas DataFrame to a database table.
+    set_config_value: Stores a configuration value in the database.
+    get_config_value: Retrieves a configuration value from the database.
+
+Table Definitions:
+    price_data: Stores price data with technical indicators.
+    news_data: Stores news articles and metadata.
+    reddit_data: Stores Reddit posts and metadata.
+    twitter_data: Stores Twitter data and metadata.
+    sentiment_analysis_results: Stores sentiment analysis results.
+    trade_log: Stores trade logs and metadata.
+    cryptopanic_sentiment: Stores sentiment data from CryptoPanic API.
+    alphavantage_health: Stores health metrics from AlphaVantage API.
+    coingecko_metrics: Stores market metrics from CoinGecko API.
+    app_config: Stores application configuration key-value pairs.
+    low_value_coin_sentiment: Stores sentiment analysis results for low-value coins.
+    low_value_cross_coin_metrics: Stores cross-coin metrics for low-value coins.
+    entity_sentiment: Stores entity sentiment analysis results.
+    topic_sentiment: Stores topic sentiment analysis results.
+    temporal_sentiment: Stores temporal sentiment patterns.
+"""
+
+import logging
+import pandas as pd
+import numpy as np
+from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, Float, DateTime, Text, JSON, UniqueConstraint, Index, inspect, BigInteger, select
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.sql import func
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+from contextlib import contextmanager
+import math
+from typing import List, Dict, Any, Optional, Union
+from typing_extensions import Literal
+import asyncpg
+import datetime
+import json
+import asyncio
+from functools import wraps
+
+import config
+
+log = logging.getLogger(__name__)
+
+# --- Database Setup ---
+DATABASE_URL = config.DATABASE_URL
+engine = None
+SessionLocal = None
+metadata = MetaData()
+_pool = None  # asyncpg connection pool
+
+if DATABASE_URL:
+    try:
+        engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        log.info(f"Database engine created")
+    except Exception as e:
+        log.error(f"Failed to create database engine: {e}", exc_info=True)
+else:
+    log.critical("DATABASE_URL not configured")
+
+# Use JSONB for PostgreSQL
+JSON_TYPE = JSONB
+
+# --- Define Database Tables ---
+price_data = Table(
+    'price_data', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('symbol', String(32), nullable=False),
+    Column('interval', String(8), nullable=False),
+    Column('open_time', DateTime(timezone=True), nullable=False),
+    Column('open', Float, nullable=False),
+    Column('high', Float, nullable=False),
+    Column('low', Float, nullable=False),
+    Column('close', Float, nullable=False),
+    Column('volume', Float, nullable=False),
+    Column('close_time', DateTime(timezone=True), nullable=False),
+    Column('sma_fast', Float, nullable=True),
+    Column('sma_slow', Float, nullable=True),
+    Column('ema_fast', Float, nullable=True),
+    Column('ema_slow', Float, nullable=True),
+    Column('rsi_value', Float, nullable=True),
+    Column('macd_line', Float, nullable=True),
+    Column('macd_signal', Float, nullable=True),
+    Column('macd_hist', Float, nullable=True),
+    Column('fetched_at', DateTime(timezone=True), server_default=func.now()),
+    UniqueConstraint('symbol', 'interval', 'open_time', name='uq_price_data_symbol_interval_time'),
+    Index('ix_price_data_symbol_interval_open_time', 'symbol', 'interval', 'open_time'),
+    Index('ix_price_data_open_time', 'open_time')
+)
+
+news_data = Table(
+    'news_data', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('source_api', String(50), nullable=False),
+    Column('source_publisher', String(100), nullable=True),
+    Column('article_id', String(255), nullable=True),
+    Column('title', String(512), nullable=False),
+    Column('text_content', Text, nullable=True),
+    Column('url', String(1024), nullable=False, unique=True),
+    Column('published_at', DateTime(timezone=True), nullable=False),
+    Column('tickers_mentioned', JSON_TYPE, nullable=True),
+    Column('fetched_at', DateTime(timezone=True), server_default=func.now()),
+    Index('ix_news_data_published_at', 'published_at'),
+    Index('ix_news_data_source_api', 'source_api')
+)
+
+reddit_data = Table(
+    'reddit_data', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('post_id', String(20), nullable=False, unique=True),
+    Column('subreddit', String(100), nullable=False),
+    Column('title', String(512), nullable=False),
+    Column('selftext', Text, nullable=True),
+    Column('url', String(1024), nullable=False),
+    Column('score', Integer, nullable=True),
+    Column('num_comments', Integer, nullable=True),
+    Column('created_utc', DateTime(timezone=True), nullable=False),
+    Column('fetched_at', DateTime(timezone=True), server_default=func.now()),
+    Index('ix_reddit_data_subreddit_created', 'subreddit', 'created_utc'),
+    Index('ix_reddit_data_created_utc', 'created_utc')
+)
+
+twitter_data = Table(
+    'twitter_data', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('tweet_id', String(30), nullable=False, unique=True),
+    Column('author_id', String(30), nullable=True),
+    Column('text', Text, nullable=False),
+    Column('created_at', DateTime(timezone=True), nullable=False),
+    Column('public_metrics', JSON_TYPE, nullable=True),
+    Column('hashtags', JSON_TYPE, nullable=True),
+    Column('cashtags', JSON_TYPE, nullable=True),
+    Column('fetched_at', DateTime(timezone=True), server_default=func.now()),
+    Index('ix_twitter_data_created_at', 'created_at')
+)
+
+sentiment_analysis_results = Table(
+    'sentiment_analysis_results', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('news_id', Integer, nullable=True),
+    Column('reddit_id', Integer, nullable=True),
+    Column('twitter_id', Integer, nullable=True),
+    Column('model_name', String(100), nullable=False),
+    Column('sentiment_label', String(20), nullable=False),
+    Column('sentiment_score', Float, nullable=False),
+    Column('analyzed_at', DateTime(timezone=True), server_default=func.now()),
+    Index('ix_sentiment_news_id', 'news_id'),
+    Index('ix_sentiment_reddit_id', 'reddit_id'),
+    Index('ix_sentiment_twitter_id', 'twitter_id'),
+    Index('ix_sentiment_analyzed_at', 'analyzed_at')
+)
+
+trade_log = Table(
+    'trade_log', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('timestamp', DateTime(timezone=True), server_default=func.now()),
+    Column('symbol', String(32), nullable=False),
+    Column('trade_type', String(4), nullable=False),
+    Column('order_type', String(10), nullable=False),
+    Column('status', String(20), nullable=False),
+    Column('binance_order_id', String(50), nullable=True),
+    Column('price', Float, nullable=False),
+    Column('quantity', Float, nullable=False),
+    Column('usd_value', Float, nullable=False),
+    Column('fee', Float, nullable=True),
+    Column('pnl', Float, nullable=True),
+    Column('signal_confidence', Float, nullable=True),
+    Column('trigger_reason', String(50), nullable=True),
+    Column('trading_mode', String(10), nullable=False),
+    Index('ix_trade_log_symbol_timestamp', 'symbol', 'timestamp'),
+    Index('ix_trade_log_timestamp', 'timestamp')
+)
+
+cryptopanic_sentiment = Table(
+    'cryptopanic_sentiment',
+    metadata,
+    Column('id', Integer, primary_key=True),
+    Column('symbol', String(20), nullable=False),
+    Column('sentiment_score', Float, nullable=False),
+    Column('bullish_count', Integer),
+    Column('bearish_count', Integer),
+    Column('total_articles', Integer),
+    Column('timestamp', DateTime(timezone=True), nullable=False),
+    Index('idx_cryptopanic_symbol_timestamp', 'symbol', 'timestamp')
+)
+
+alphavantage_health = Table(
+    'alphavantage_health',
+    metadata,
+    Column('id', Integer, primary_key=True),
+    Column('symbol', String(20), nullable=False),
+    Column('health_score', Float, nullable=False),
+    Column('rsi', Float),
+    Column('macd', Float),
+    Column('macd_signal', Float),
+    Column('timestamp', DateTime(timezone=True), nullable=False),
+    Index('idx_alphavantage_symbol_timestamp', 'symbol', 'timestamp')
+)
+
+coingecko_metrics = Table(
+    'coingecko_metrics',
+    metadata,
+    Column('id', Integer, primary_key=True),
+    Column('symbol', String(20), nullable=False),
+    Column('market_cap', BigInteger),
+    Column('total_volume', BigInteger),
+    Column('price_change_24h', Float),
+    Column('market_cap_rank', Integer),
+    Column('community_score', Float),
+    Column('public_interest_score', Float),
+    Column('timestamp', DateTime(timezone=True), nullable=False),
+    Index('idx_coingecko_symbol_timestamp', 'symbol', 'timestamp')
+)
+
+# --- Database Tables for Low-Value Coin Sentiment Analysis ---
+low_value_coin_sentiment = Table(
+    'low_value_coin_sentiment', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('symbol', String(20), nullable=False),
+    Column('price', Float, nullable=False),
+    Column('avg_sentiment', Float, nullable=False),
+    Column('std_sentiment', Float, nullable=True),
+    Column('max_sentiment', Float, nullable=True),
+    Column('min_sentiment', Float, nullable=True),
+    Column('tweet_count', Integer, nullable=True),
+    Column('avg_positive', Float, nullable=True),
+    Column('avg_negative', Float, nullable=True),
+    Column('avg_neutral', Float, nullable=True),
+    Column('finbert_samples', Integer, nullable=True),
+    Column('timestamp', DateTime(timezone=True), nullable=False),
+    Index('idx_low_value_coin_sentiment_symbol_timestamp', 'symbol', 'timestamp')
+)
+
+low_value_cross_coin_metrics = Table(
+    'low_value_cross_coin_metrics', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('coins_analyzed', Integer, nullable=False),
+    Column('most_positive_coin', String(20), nullable=True),
+    Column('most_negative_coin', String(20), nullable=True),
+    Column('avg_sentiment_all', Float, nullable=True),
+    Column('positive_coins', JSON_TYPE, nullable=True),
+    Column('positive_coin_count', Integer, nullable=True),
+    Column('timestamp', DateTime(timezone=True), nullable=False),
+    Index('idx_low_value_cross_coin_timestamp', 'timestamp')
+)
+
+# --- Entity and Topic Sentiment Tables ---
+entity_sentiment = Table(
+    'entity_sentiment', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('text', Text, nullable=True),
+    Column('entities', JSON_TYPE, nullable=False),
+    Column('timestamp', DateTime(timezone=True), nullable=False),
+    Index('idx_entity_sentiment_timestamp', 'timestamp')
+)
+
+topic_sentiment = Table(
+    'topic_sentiment', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('topic_sentiments', JSON_TYPE, nullable=False),
+    Column('timestamp', DateTime(timezone=True), nullable=False),
+    Index('idx_topic_sentiment_timestamp', 'timestamp')
+)
+
+temporal_sentiment = Table(
+    'temporal_sentiment', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('window_hours', Integer, nullable=False),
+    Column('temporal_metrics', JSON_TYPE, nullable=False),
+    Column('timestamp', DateTime(timezone=True), nullable=False),
+    Index('idx_temporal_sentiment_timestamp', 'timestamp')
+)
+
+# --- App Configuration ---
+app_config = Table(
+    'app_config', metadata,
+    Column('key', String(255), primary_key=True),
+    Column('value', Text, nullable=True),
+    Column('updated_at', DateTime(timezone=True), server_default=func.now()),
+    Index('ix_app_config_updated_at', 'updated_at')
+)
+
+# --- Utility Functions ---
+
+async def get_pool():
+    """Get or create the database connection pool"""
+    global _pool
+    if _pool is None:
+        try:
+            _pool = await asyncpg.create_pool(DATABASE_URL)
+        except Exception as e:
+            log.error(f"Error creating connection pool: {e}")
+            return None
+    return _pool
+
+def requires_pool(f):
+    """Decorator to ensure a pool exists for async database operations"""
+    @wraps(f)
+    async def wrapper(*args, **kwargs):
+        pool = await get_pool()
+        if pool is None:
+            raise RuntimeError("Could not establish database connection pool")
+        return await f(*args, **kwargs)
+    return wrapper
+
+@requires_pool
+async def async_execute(query: str, *args):
+    """Execute a query asynchronously"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.execute(query, *args)
+
+@requires_pool
+async def async_fetch(query: str, *args):
+    """Fetch results from a query asynchronously"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(query, *args)
+
+@requires_pool
+async def async_fetchval(query: str, *args):
+    """Fetch a single value asynchronously"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(query, *args)
+
+async def async_df_to_db(df: pd.DataFrame, table_name: str, if_exists: str = 'append') -> bool:
+    """Asynchronously write DataFrame to database using COPY"""
+    try:
+        # Handle timezone-aware datetime columns
+        for col in df.select_dtypes(include=['datetime64[ns]']):
+            dt_accessor = getattr(df[col], 'dt', None)
+            if dt_accessor is not None:
+                if not hasattr(dt_accessor, 'tz') or dt_accessor.tz is None:
+                    df[col] = dt_accessor.tz_localize('UTC')
+
+        # Replace inf/-inf values with None
+        df = df.replace([np.inf, -np.inf], None)
+
+        # Create temporary file for COPY
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w+', suffix='.csv') as temp:
+            df.to_csv(temp.name, index=False, header=False)
+            temp.flush()
+
+            pool = await get_pool()
+            if not pool:
+                return False
+
+            async with pool.acquire() as conn:
+                if if_exists == 'replace':
+                    await conn.execute(f'TRUNCATE TABLE {table_name}')
+
+                with open(temp.name, 'r') as f:
+                    await conn.copy_to_table(
+                        table_name,
+                        source=f,
+                        columns=df.columns.tolist()
+                    )
+            return True
+    except Exception as e:
+        log.error(f"Error in async_df_to_db: {e}")
+        return False
+
+# Update existing functions to have async alternatives
+async def async_bulk_insert(data_list: List[Dict], table_name: str, unique_columns: List[str] = None):
+    """Async bulk insert with COPY command"""
+    if not data_list:
+        return
+
+    # Convert data to DataFrame for efficient COPY
+    df = pd.DataFrame(data_list)
+    return await async_df_to_db(df, table_name, if_exists='append')
+
+# Keep existing synchronous functions as fallback...
+def init_db():
+    """Creates database tables if they don't exist."""
+    if not engine:
+        log.error("Cannot initialize database, engine not configured.")
+        return False
+    if not metadata.tables:
+        log.warning("No tables defined in metadata, skipping init_db.")
+        return False
+    try:
+        log.info("Attempting to create database tables if they don't exist...")
+        metadata.create_all(bind=engine)
+        log.info("Database tables checked/created successfully.")
+        return True
+    except Exception as e:
+        log.error(f"Unexpected error initializing database: {e}", exc_info=True)
+        return False
+
+@contextmanager
+def get_db_session():
+    """Provides a database session using a context manager pattern."""
+    if not SessionLocal:
+        log.error("SessionLocal not configured. Cannot get DB session.")
+        yield None
+        return
+
+    db = SessionLocal()
+    try:
+        log.debug("DB Session opened.")
+        yield db
+    except SQLAlchemyError as e:
+         log.error(f"Database session error: {e}", exc_info=True)
+         db.rollback()
+         raise
+    except Exception as e:
+         log.error(f"Unexpected error in DB session context: {e}", exc_info=True)
+         db.rollback()
+         raise
+    finally:
+        log.debug("DB Session closed.")
+        db.close()
+
+# Example of running init_db directly (for setup)
+if __name__ == '__main__':
+    logging.basicConfig(level=config.LOG_LEVEL, format='%(asctime)s - %(levelname)s [%(name)s] %(message)s')
+    log_main = logging.getLogger(__name__)
+
+    print("Attempting to initialize database schema (Direct Run)...")
+    if config.DATABASE_URL:
+        if init_db():
+             print("Database initialization check complete.")
+        else:
+             print("Database initialization failed. Check logs.")
+    else:
+         print("DATABASE_URL not found in config, skipping initialization.")

@@ -202,20 +202,22 @@ except ValueError as e:
 
 
 # --- Database Configuration ---
-DATABASE_URL = get_env_variable("DATABASE_URL", required=True)
+# Azure PostgreSQL connection string
+DATABASE_URL = "postgresql://Justin:Thomas12@cyclonev2.postgres.database.azure.com:5432/postgres?sslmode=require"
 
 # --- API Keys ---
-BINANCE_API_KEY = get_env_variable("BINANCE_API_KEY", required=True)
-BINANCE_SECRET_KEY = get_env_variable("BINANCE_SECRET_KEY", required=True)
-BINANCE_TLD = get_env_variable("BINANCE_TLD", "us")
+# Make these optional for backfill scripts
+BINANCE_API_KEY = get_env_variable("BINANCE_API_KEY", "", required=False)
+BINANCE_SECRET_KEY = get_env_variable("BINANCE_SECRET_KEY", "", required=False)
+BINANCE_TLD = get_env_variable("BINANCE_TLD", "us", required=False)
 
-CRYPTONEWS_API_TOKEN = get_env_variable("CRYPTONEWS_API_TOKEN", required=True)
+CRYPTONEWS_API_TOKEN = get_env_variable("CRYPTONEWS_API_TOKEN", "", required=False)
 
-REDDIT_CLIENT_ID = get_env_variable("REDDIT_CLIENT_ID", required=True)
-REDDIT_CLIENT_SECRET = get_env_variable("REDDIT_CLIENT_SECRET", required=True)
-REDDIT_USER_AGENT = get_env_variable("REDDIT_USER_AGENT", required=True)
+REDDIT_CLIENT_ID = get_env_variable("REDDIT_CLIENT_ID", "", required=False)
+REDDIT_CLIENT_SECRET = get_env_variable("REDDIT_CLIENT_SECRET", "", required=False)
+REDDIT_USER_AGENT = get_env_variable("REDDIT_USER_AGENT", "Crypto Backfill Script", required=False)
 
-TWITTER_BEARER_TOKEN = get_env_variable("TWITTER_BEARER_TOKEN", required=True)
+TWITTER_BEARER_TOKEN = get_env_variable("TWITTER_BEARER_TOKEN", "", required=False)
 
 # API Settings for new integrations
 CRYPTOPANIC_API_TOKEN = get_env_variable_flexible(
@@ -223,24 +225,18 @@ CRYPTOPANIC_API_TOKEN = get_env_variable_flexible(
     default='',
     required=False
 )
-
-# AlphaVantage Configuration - use flexible naming convention to find the key
-ALPHAVANTAGE_API_KEY = get_env_variable_flexible(
-    ['ALPHAVANTAGE_API_KEY', 'AlphaVantage_API_Key', 'ALPHAVANTAGE_API_TOKEN', 'AlphaVantage_API_Token'],
-    default='dummy_key_for_testing',  # Add default for testing
-    required=False  # Changed from True to False to allow testing without this key
-)
-ALPHAVANTAGE_BASE_URL = 'https://www.alphavantage.co/query'
-ALPHAVANTAGE_RATE_LIMIT = 5  # Calls per minute for free tier
-ALPHAVANTAGE_RATE_LIMIT_PERIOD = 60  # Period in seconds
+CRYPTOPANIC_API_KEY = CRYPTOPANIC_API_TOKEN  # Alias for compatibility with code expecting CRYPTOPANIC_API_KEY
 
 # CoinGecko Configuration
 COINGECKO_API_KEY = get_env_variable_flexible(
     ['COINGECKO_API_KEY', 'CoinGecko_API_Key', 'COINGECKO_API_TOKEN', 'CoinGecko_API_Token'],
-    default=''  # Make it optional as CoinGecko has free tier without key
+    default='',  # Make it optional as CoinGecko has free tier without key
+    required=False
 )
-COINGECKO_CALLS_PER_MINUTE = 50
-COINGECKO_FETCH_INTERVAL = 300  # 5 minutes
+COINGECKO_API_BASE = get_env_variable("COINGECKO_API_BASE", "https://api.coingecko.com/api/v3", required=False)
+COINGECKO_CALLS_PER_MINUTE = get_env_variable("COINGECKO_CALLS_PER_MINUTE", 500, var_type=int)  # Updated to 500 for Pro plan
+COINGECKO_MONTHLY_LIMIT = get_env_variable("COINGECKO_MONTHLY_LIMIT", 500000, var_type=int)
+COINGECKO_FETCH_INTERVAL = get_env_variable("COINGECKO_FETCH_INTERVAL", 60, var_type=int)  # Reduced to 1 min
 
 # --- Sentiment Model ---
 SENTIMENT_MODEL_NAME = get_env_variable("SENTIMENT_MODEL_NAME", "ProsusAI/finbert")
@@ -262,13 +258,9 @@ MODEL_RETRAIN_INTERVAL = get_env_variable("MODEL_RETRAIN_INTERVAL", 86400, var_t
 CRYPTOCOMPARE_CALLS_PER_MINUTE = 30
 CRYPTOCOMPARE_FETCH_INTERVAL = 300  # 5 minutes
 
-# AlphaVantage (free tier: 5 calls/minute, 500 calls/day)
-ALPHAVANTAGE_CALLS_PER_MINUTE = 5
-ALPHAVANTAGE_FETCH_INTERVAL = 900  # 15 minutes
-
-# CoinGecko (free tier: 10-50 calls/minute)
-COINGECKO_CALLS_PER_MINUTE = 10
-COINGECKO_FETCH_INTERVAL = 300  # 5 minutes
+# CoinGecko (Pro tier: 500 calls/minute, 500k calls/month)
+COINGECKO_CALLS_PER_MINUTE = 500
+COINGECKO_FETCH_INTERVAL = 60  # 1 minute with Pro plan
 
 # CryptoPanic (free tier limits)
 CRYPTOPANIC_CALLS_PER_MINUTE = 15
@@ -277,6 +269,9 @@ CRYPTOPANIC_FETCH_INTERVAL = 600  # 10 minutes
 # Santiment (free tier limits)
 SANTIMENT_CALLS_PER_MINUTE = 10
 SANTIMENT_FETCH_INTERVAL = 900  # 15 minutes
+
+# Reddit (free tier limits)
+REDDIT_CALLS_PER_MINUTE = get_env_variable("REDDIT_CALLS_PER_MINUTE", 60, var_type=int)
 
 # Data backfill settings
 BACKFILL_DAYS = 30  # Number of days to backfill by default
@@ -292,6 +287,14 @@ TRADE_TARGET_SYMBOL_PRICE_USD = get_env_variable("TRADE_TARGET_SYMBOL_PRICE_USD"
 BUY_CONFIDENCE_THRESHOLD = 0.55  # Lowered from 0.65 to increase trade frequency
 SELL_CONFIDENCE_THRESHOLD = 0.55  # Lowered from 0.65 to align with buy threshold
 
+# --- Low-Value Coin Trading Parameters ---
+LOW_VALUE_COIN_ENABLED = get_env_variable("LOW_VALUE_COIN_ENABLED", True, var_type=bool)
+LOW_VALUE_PRICE_THRESHOLD = get_env_variable("LOW_VALUE_PRICE_THRESHOLD", 1.0, var_type=float)
+LOW_VALUE_COIN_PRIORITY = get_env_variable("LOW_VALUE_COIN_PRIORITY", True, var_type=bool)  # Prioritize trading low-value coins
+LOW_VALUE_POSITION_PERCENTAGE = get_env_variable("LOW_VALUE_POSITION_PERCENTAGE", 0.03, var_type=float)  # Higher percentage (3% vs 2% standard)
+LOW_VALUE_SENTIMENT_THRESHOLD = get_env_variable("LOW_VALUE_SENTIMENT_THRESHOLD", 0.2, var_type=float)  # Minimum sentiment score to consider buying
+LOW_VALUE_TWEET_VOLUME_FACTOR = get_env_variable("LOW_VALUE_TWEET_VOLUME_FACTOR", 2.0, var_type=float)  # Minimum factor above average to consider significant
+
 # --- Model Training Parameters ---
 FEATURE_LAG_PERIODS = get_env_variable("FEATURE_LAG_PERIODS", 20, var_type=int)
 SENTIMENT_AGG_WINDOW_SHORT = get_env_variable("SENTIMENT_AGG_WINDOW_SHORT", '1h')  # Pandas offset string
@@ -300,13 +303,38 @@ PREDICTION_HORIZON_PERIODS = get_env_variable("PREDICTION_HORIZON_PERIODS", 3, v
 
 # --- Data Collection Parameters ---
 CANDLE_INTERVAL = get_env_variable("CANDLE_INTERVAL", "5m", var_type=str)  # Default to 5-minute candles
-TARGET_SUBREDDITS = get_env_variable("TARGET_SUBREDDITS", ['CryptoCurrency', 'Bitcoin', 'altcoin', 'SatoshiStreetBets', 'CryptoMoonShots', 'WallStreetBetsCrypto'], var_type=list)
+TARGET_SUBREDDITS = get_env_variable("TARGET_SUBREDDITS", [
+    'CryptoCurrency', 
+    'Bitcoin', 
+    'CryptoMarkets',
+    'Altcoin',
+    'BitcoinBeginners',
+    'CryptoMoonShots', 
+    'SatoshiStreetBets',
+    'Ethereum',
+    'WallStreetBetsCrypto'
+], var_type=list)
 REDDIT_POST_LIMIT = get_env_variable("REDDIT_POST_LIMIT", 25, var_type=int)  # Per subreddit per fetch cycle
 TWITTER_QUERY_KEYWORDS = get_env_variable("TWITTER_QUERY_KEYWORDS", ['crypto', 'bitcoin'], var_type=list)  # Base keywords, will be combined with symbols
 TWITTER_MAX_RESULTS_PER_FETCH = get_env_variable("TWITTER_MAX_RESULTS_PER_FETCH", 100, var_type=int)  # Max per symbol/query per cycle (max 100 for recent search)
+TWITTER_FETCH_LIMIT = get_env_variable("TWITTER_FETCH_LIMIT", 100, var_type=int)  # Total tweets to fetch per query
+
+# Crypto influencers to track on Twitter
+TWITTER_INFLUENCERS = get_env_variable("TWITTER_INFLUENCERS", [
+    'balajis', 'ErikVoorhees', 'VitalikButerin', 'rogerkver', 'cdixon', 
+    'pmarca', 'paulg', 'laurashin', 'CryptoWendyO', 'AltcoinDailyio', 
+    'PeterLBrandt', 'woonomic', 'CryptoYoda1338', 'VentureCoinist', 
+    'Crypto_Ed_NL', 'CryptoChoe', 'Cryptoboater', 'ZeusZissou', 
+    'Crypto_Bitlord', 'Cryptodemedici', 'CarpeNoctom', 'ToneVays', 
+    'PhilakoneCrypto', 'CryptoEye111', 'MMCrypto', 'rovercrc', 
+    'Ashcryptoreal', 'CryptoCapo_', 'saylor', 'CryptoGodJohn', 
+    'CryptoMichNL', 'ERVA_AH', 'ali_charts', 'KoroushAK', 'Trader_XO', 
+    'CryptoTony__', 'CryptoCred', 'CryptooELITES', 'Steph_iscrypto', 
+    'Washigorira', 'OTC_Bitcoin', 'hiRavenCrypto', 'CryptoDeus2', 
+    '_ChrisOG', 'TheCryptoDog', 'PeterMcCormack', 'LayahHeilpern', 'coinboundio'
+], var_type=list)
 
 # --- Technical Indicator Parameters ---
-# Define periods for indicators (can be customized)
 SMA_FAST_PERIOD = get_env_variable("SMA_FAST_PERIOD", 10, var_type=int)
 SMA_SLOW_PERIOD = get_env_variable("SMA_SLOW_PERIOD", 50, var_type=int)
 EMA_FAST_PERIOD = get_env_variable("EMA_FAST_PERIOD", 12, var_type=int)
@@ -316,8 +344,8 @@ MACD_FAST_PERIOD = get_env_variable("MACD_FAST_PERIOD", 12, var_type=int)
 MACD_SLOW_PERIOD = get_env_variable("MACD_SLOW_PERIOD", 26, var_type=int)
 MACD_SIGNAL_PERIOD = get_env_variable("MACD_SIGNAL_PERIOD", 9, var_type=int)
 
-# Base cryptocurrency symbols to track
-BASE_SYMBOLS: List[str] = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'DOT']
+# Base cryptocurrency symbols to track (use Binance trading pairs for compatibility)
+BASE_SYMBOLS: List[str] = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'DOTUSDT']
 
 # --- Function to check essential config ---
 def check_essential_config():

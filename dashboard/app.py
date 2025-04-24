@@ -1,51 +1,94 @@
-# /dashboard/app.py
+"""
+Main dashboard application module with async support
+"""
 
+import asyncio
+from typing import Dict, Any
 import logging
-import dash
+import os
+import sys
+from dash import Dash, html
 import dash_bootstrap_components as dbc
-from dash import html
+from flask import Flask
 
-# Use absolute imports assuming 'cyclonev2' is the project root added to PYTHONPATH
-import config # To potentially set Dash debug mode based on LOG_LEVEL
-# Use explicit absolute imports for modules within the dashboard package
-import dashboard.layouts as layouts
-import dashboard.callbacks as callbacks
-# from .. import config # Use this if config was one level up from dashboard
+# Add project root to PYTHONPATH
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(project_root)
+
+from dashboard.layouts import create_layout
+from dashboard.callbacks import register_callbacks
+from dashboard.config_manager import config_manager
+from dashboard.data_provider import (
+    get_price_data,
+    get_sentiment_data,
+    get_market_metrics,
+    get_technical_indicators,
+    get_social_metrics
+)
 
 log = logging.getLogger(__name__)
 
-# --- Initialize Dash App ---
-# Load external stylesheets (Bootstrap theme)
-external_stylesheets = [dbc.themes.BOOTSTRAP] # Or choose another theme like CYBORG, DARKLY
+# Initialize Flask for server
+server = Flask(__name__)
 
-app = dash.Dash(
+# Initialize the resources needed by the dashboard
+def init_resources():
+    """
+    Initialize resources for the dashboard
+    """
+    log.info("Initializing dashboard resources...")
+    
+    # Initialize config_manager and ensure DB tables exist
+    try:
+        # Create necessary database tables for config tracking
+        # This will be handled by the config_manager when it's first used
+        log.info("Configuration management system initialized")
+    except Exception as e:
+        log.error(f"Error initializing configuration system: {e}")
+
+# Initialize resources immediately instead of waiting for first request
+init_resources()
+
+# Initialize Dash with Bootstrap and Font Awesome for icons
+app = Dash(
     __name__,
-    external_stylesheets=external_stylesheets,
-    suppress_callback_exceptions=True, # Set to True if callbacks are in different files
-    title="Cyclone v2 Dashboard"
+    server=server,
+    external_stylesheets=[
+        dbc.themes.DARKLY,
+        dbc.icons.FONT_AWESOME  # Add Font Awesome for icons
+    ],
+    suppress_callback_exceptions=True
 )
-server = app.server # Expose server for potential WSGI deployment (e.g., Gunicorn)
 
-# --- Define App Layout ---
-app.layout = layouts.create_main_layout()
+# Set page title
+app.title = "Cyclone v2 Trading System"
 
-# --- Register Callbacks ---
-# Call the function from callbacks.py to register all callbacks
-callbacks.register_callbacks(app)
+# Create the layout
+app.layout = create_layout()
 
-# --- Run the App ---
+# Register callbacks
+register_callbacks(app)
+
+def update_data_cache(symbol: str) -> Dict[str, Any]:
+    """
+    Update all data sources
+    """
+    try:
+        # We'll handle async operations differently with Flask
+        # For now, just return an empty dict as a placeholder
+        return {}
+        
+    except Exception as e:
+        log.error(f"Error updating data cache: {e}")
+        return {}
+
+# Setup proper entry point for running the dashboard
 if __name__ == '__main__':
-    # Setup basic logging for dashboard process if run directly
-    # Note: If run via main.py, logging might be configured there already
-    # Check if logging is already configured by root logger to avoid duplicate handlers
-    if not logging.getLogger().hasHandlers():
-        log_level_dashboard = getattr(logging, config.LOG_LEVEL, logging.INFO)
-        logging.basicConfig(level=log_level_dashboard, format='%(asctime)s - %(levelname)s [%(name)s] %(message)s')
-
-    log.info("Starting Dash development server...")
-    # Set debug=True for development (enables hot-reloading, detailed error pages)
-    # Set debug=False for production deployment
-    debug_mode = config.LOG_LEVEL == "DEBUG"
-    # Use app.run (corrected from run_server)
-    app.run(debug=debug_mode, host='0.0.0.0', port=8051) # Using port 8051 as decided earlier
-    # Use host='0.0.0.0' to make it accessible on your network
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Run the Flask server with Dash mounted on it
+    server.run(host='0.0.0.0', port=8053, debug=True)

@@ -177,9 +177,17 @@ def _prepare_features(df: pd.DataFrame) -> Tuple[List[str], pd.DataFrame]:
     # Time features
     time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
     
+    # Low-value coin sentiment features
+    low_value_coin_features = [col for col in df.columns if col.startswith('lvs_')]
+    cross_coin_features = [col for col in df.columns if col.startswith('cross_')]
+    
+    # Check if this symbol is the most positive or negative
+    special_indicators = [col for col in df.columns if col.startswith('is_most_')]
+    
     # Combine all features
     feature_columns = (base_features + sentiment_features + alphavantage_features + 
-                      coingecko_features + time_features)
+                      coingecko_features + time_features + low_value_coin_features + 
+                      cross_coin_features + special_indicators)
     
     # Create feature importance groups for later analysis
     feature_groups = {
@@ -187,7 +195,10 @@ def _prepare_features(df: pd.DataFrame) -> Tuple[List[str], pd.DataFrame]:
         'sentiment': sentiment_features,
         'health_metrics': alphavantage_features,
         'market_metrics': coingecko_features,
-        'time': time_features
+        'time': time_features,
+        'low_value_sentiment': low_value_coin_features,
+        'cross_coin_metrics': cross_coin_features,
+        'special_indicators': special_indicators
     }
     
     # Store feature groups in metadata
@@ -195,6 +206,9 @@ def _prepare_features(df: pd.DataFrame) -> Tuple[List[str], pd.DataFrame]:
         'feature_groups': feature_groups,
         'total_features': len(feature_columns)
     }
+    
+    # Create directory if it doesn't exist
+    os.makedirs('trained_models', exist_ok=True)
     
     # Save metadata
     with open('trained_models/feature_metadata.json', 'w') as f:

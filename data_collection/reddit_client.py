@@ -1,93 +1,50 @@
 # /data_collection/reddit_client.py
 
 import logging
-import praw
 import datetime
 import pytz
-from prawcore.exceptions import ResponseException, RequestException, PrawcoreException
-from typing import List, Dict
-import time
+from typing import List, Dict, Optional
+import asyncio
+import asyncpraw
+from asyncpraw.models import Subreddit
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Use absolute imports assuming 'cyclonev2' is the project root added to PYTHONPATH
 import config
-# from .. import config # Use relative import if running as part of a package
+from database.db_utils import async_bulk_insert
 
 log = logging.getLogger(__name__)
 
-# --- Reddit Client Initialization ---
+# Instead of initializing Reddit directly, create a function to get the Reddit client
+# This prevents the "no event loop" error when importing the module
 _reddit_client = None
 
-def get_reddit_client():
-    """Initializes and returns the PRAW Reddit instance singleton."""
+async def get_reddit_client():
+    """Get or create the Reddit API client"""
     global _reddit_client
     if _reddit_client is None:
-        client_id = config.REDDIT_CLIENT_ID
-        client_secret = config.REDDIT_CLIENT_SECRET
-        user_agent = config.REDDIT_USER_AGENT
-        # Optional: Add username/password if needed for specific actions, but read-only is usually sufficient
-        # username = config.REDDIT_USERNAME
-        # password = config.REDDIT_PASSWORD
-
-        if not all([client_id, client_secret, user_agent]):
-            log.error("Reddit API credentials (client ID, secret, user agent) are not fully configured.")
-            return None
-
-        try:
-            log.info("Initializing PRAW Reddit instance...")
-            _reddit_client = praw.Reddit(
-                client_id=client_id,
-                client_secret=client_secret,
-                user_agent=user_agent,
-                # username=username, # Uncomment if using username/password
-                # password=password, # Uncomment if using username/password
-                read_only=True # Set to False if write actions are needed
-            )
-            # Basic check to see if authentication worked (optional)
-            # log.info(f"Reddit client authenticated as: {_reddit_client.user.me()}") # Requires read_only=False or OAuth
-            log.info("PRAW Reddit instance initialized successfully (read_only mode).")
-        except PrawcoreException as e:
-            log.error(f"PRAW Error initializing Reddit instance: {e}", exc_info=True)
-            _reddit_client = None
-        except Exception as e:
-            log.error(f"Unexpected error initializing PRAW Reddit instance: {e}", exc_info=True)
-            _reddit_client = None
+        _reddit_client = asyncpraw.Reddit(
+            client_id=config.REDDIT_CLIENT_ID,
+            client_secret=config.REDDIT_CLIENT_SECRET,
+            user_agent=config.REDDIT_USER_AGENT
+        )
     return _reddit_client
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def fetch_new_subreddit_posts(subreddit_names: List[str], post_limit_per_subreddit: int = config.REDDIT_POST_LIMIT) -> List[Dict]:
+async def fetch_new_subreddit_posts(subreddit_names: List[str], post_limit_per_subreddit: int = config.REDDIT_POST_LIMIT) -> List[Dict]:
     """
-    Fetches the newest posts (submissions) from specified subreddits with retry logic.
-
-    Args:
-        subreddit_names (list): A list of subreddit names (without 'r/').
-        post_limit_per_subreddit (int): Max number of posts to fetch from the 'new' section
-                                         of each subreddit per call.
-
-    Returns:
-        list: A list of dictionaries representing posts. Empty list on failure.
-              Includes 'created_utc_dt' key with timezone-aware UTC datetime.
+    Fetch new posts from specified subreddits.
+    Returns list of processed posts.
     """
-    reddit = get_reddit_client()
-    if reddit is None:
-        log.error("Cannot fetch Reddit posts, PRAW instance not available.")
-        return []
-
-    reddit_posts = []
-    if not isinstance(subreddit_names, list):
-        log.error("Subreddits parameter must be a list.")
-        return []
-
     log.info(f"Fetching up to {post_limit_per_subreddit} new posts from subreddits: {subreddit_names}")
+    
+    all_posts = []
+    reddit = await get_reddit_client()
 
     for sub_name in subreddit_names:
         try:
             log.debug(f"Accessing subreddit: r/{sub_name}")
-            subreddit = reddit.subreddit(sub_name)
-            new_posts = subreddit.new(limit=post_limit_per_subreddit)
-
-            count = 0
-            for post in new_posts:
+            subreddit = await reddit.subreddit(sub_name)
+            async for post in subreddit.new(limit=post_limit_per_subreddit):
                 if post.stickied:
                     log.debug(f"Skipping stickied post in r/{sub_name}: {post.id}")
                     continue
@@ -98,59 +55,87 @@ def fetch_new_subreddit_posts(subreddit_names: List[str], post_limit_per_subredd
 
                 created_utc_dt = datetime.datetime.fromtimestamp(post.created_utc, tz=pytz.utc)
 
-                reddit_posts.append({
+                processed_post = {
                     'post_id': post.id,
-                    'subreddit': sub_name.lower(),
+                    'subreddit': post.subreddit.display_name,
                     'title': post.title,
                     'selftext': post.selftext if post.is_self else None,
-                    'text_combined': post_text_combined,
-                    'url': f"https://www.reddit.com{post.permalink}",
+                    'url': post.url,
                     'score': post.score,
                     'num_comments': post.num_comments,
-                    'created_utc_dt': created_utc_dt,
-                })
-                count += 1
-            log.info(f"Fetched {count} posts from r/{sub_name}")
+                    'created_utc': created_utc_dt,
+                    'fetched_at': datetime.datetime.now(pytz.utc)
+                }
+                all_posts.append(processed_post)
+
+            log.debug(f"Fetched {len(all_posts)} posts from r/{sub_name}")
+            
+            # Small delay between subreddits
+            await asyncio.sleep(0.5)
 
         except Exception as e:
-            log.error(f"Error processing subreddit r/{sub_name}: {e}", exc_info=True)
+            log.error(f"Error fetching posts from r/{sub_name}: {e}", exc_info=True)
+            continue
 
-    log.info(f"Finished fetching Reddit posts. Total items collected: {len(reddit_posts)}")
-    return reddit_posts
+    # Store posts in database
+    if all_posts:
+        try:
+            await async_bulk_insert(all_posts, 'reddit_data')
+            log.info(f"Successfully stored {len(all_posts)} Reddit posts")
+        except Exception as e:
+            log.error(f"Error storing Reddit posts in database: {e}")
 
+    return all_posts
 
-# --- Example Usage (for testing) ---
-if __name__ == '__main__':
-    # Setup basic logging for direct script run
-    logging.basicConfig(level=config.LOG_LEVEL, format='%(asctime)s - %(levelname)s [%(name)s] %(message)s')
-
-    print("--- Testing Reddit Client ---")
-
-    # Check credentials loaded via config
-    if not all([config.REDDIT_CLIENT_ID, config.REDDIT_CLIENT_SECRET, config.REDDIT_USER_AGENT]):
-         print("\nERROR: Reddit API credentials not fully configured in .env")
-    else:
-        target_subs = config.TARGET_SUBREDDITS[:2] # Test with first 2 configured subreddits
-        print(f"\nFetching latest posts from subreddits: {target_subs}...")
-
-        posts_list = fetch_new_subreddit_posts(subreddit_names=target_subs, post_limit_per_subreddit=5)
-
-        if posts_list:
-            print(f"Fetched {len(posts_list)} total posts.")
-            print("\nFirst post details:")
-            first_post = posts_list[0]
-            for key, value in first_post.items():
-                 # Truncate long text fields for display
-                 if key in ['selftext', 'text_combined'] and value and len(value) > 100:
-                     print(f"  {key}: {value[:100]}...")
-                 else:
-                     print(f"  {key}: {value}")
-            # Verify UTC conversion
-            if first_post.get('created_utc_dt'):
-                print(f"  Created (UTC): {first_post['created_utc_dt']}")
-                print(f"  Is UTC Timezone Aware: {first_post['created_utc_dt'].tzinfo is not None}")
-        else:
-            print("Could not fetch any Reddit posts. Check logs for errors.")
-
-    print("\n--- Test Complete ---")
+async def fetch_reddit_posts(
+    query: str,
+    after: Optional[datetime.datetime] = None,
+    limit: int = 50
+) -> List[Dict]:
+    """
+    Fetch Reddit posts for a specific query for the dashboard.
+    
+    Args:
+        query: Search query for subreddits or keywords
+        after: Only include posts after this timestamp
+        limit: Maximum number of posts to fetch
+        
+    Returns:
+        List of processed Reddit posts
+    """
+    try:
+        log.info(f"Fetching Reddit posts for query: {query}")
+        
+        # For the dashboard, we'll use the query to determine which subreddits to check
+        crypto_subreddits = config.REDDIT_SUBREDDITS
+        
+        # Get posts from relevant subreddits
+        posts = await fetch_new_subreddit_posts(crypto_subreddits, limit)
+        
+        # Filter posts that match the query
+        if query:
+            query_lower = query.lower()
+            filtered_posts = []
+            
+            for post in posts:
+                # Check if query matches in title or selftext
+                title = post.get('title', '').lower()
+                selftext = post.get('selftext', '') or ''
+                selftext = selftext.lower()
+                
+                if query_lower in title or query_lower in selftext:
+                    filtered_posts.append(post)
+            
+            posts = filtered_posts
+        
+        # Filter by date if needed
+        if after:
+            posts = [post for post in posts if post['created_utc'] >= after]
+            
+        log.info(f"Found {len(posts)} Reddit posts matching query: {query}")
+        return posts
+        
+    except Exception as e:
+        log.error(f"Error fetching Reddit posts for query {query}: {e}")
+        return []
 

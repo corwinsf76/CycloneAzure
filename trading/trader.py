@@ -30,6 +30,7 @@ from sentiment_analysis.analyzer import get_current_sentiment_score
 from sentiment_analysis.advanced_sentiment import get_sentiment_adjusted_prediction
 from sentiment_analysis.cross_asset_sentiment import get_cross_asset_adjusted_prediction, get_current_base_sentiments
 from trading.contrarian_strategy import get_contrarian_adjusted_prediction
+from trading.low_value_strategy import get_low_value_adjusted_prediction  # Import our new low-value coin strategy
 from trading.portfolio import Portfolio
 from modeling.predictor import PredictionModel
 
@@ -120,7 +121,7 @@ class Trader:
         
         # Step 3: Apply sentiment lag adjustment
         sentiment_adjusted = await get_sentiment_adjusted_prediction(
-            symbol, model_prediction, sentiment_score
+            symbol, (pred_class, pred_prob), sentiment_score
         )
         metadata['sentiment_adjusted'] = {'class': sentiment_adjusted[0], 'probability': sentiment_adjusted[1]}
         
@@ -136,17 +137,52 @@ class Trader:
         price_data = await self._get_price_data(symbol, config.CANDLE_INTERVAL)
         if price_data.empty:
             log.warning(f"No recent price data available for {symbol}, skipping contrarian analysis")
-            final_prediction = cross_asset_adjusted
+            contrarian_adjusted = cross_asset_adjusted
         else:
             # Apply contrarian strategy adjustment
             contrarian_adjusted = await get_contrarian_adjusted_prediction(
                 symbol, cross_asset_adjusted, sentiment_score, price_data
             )
             metadata['contrarian_adjusted'] = {'class': contrarian_adjusted[0], 'probability': contrarian_adjusted[1]}
+        
+        # Step 6: Apply specialized low-value coin strategy adjustment
+        if config.LOW_VALUE_COIN_ENABLED:
+            low_value_adjusted = await get_low_value_adjusted_prediction(symbol, contrarian_adjusted)
+            
+            # Check if the low-value strategy modified the prediction
+            if low_value_adjusted != contrarian_adjusted:
+                metadata['low_value_adjusted'] = {'class': low_value_adjusted[0], 'probability': low_value_adjusted[1]}
+                final_prediction = low_value_adjusted
+                
+                log.info(f"Low-value coin strategy adjusted prediction for {symbol}: " +
+                        f"{contrarian_adjusted[0]}→{low_value_adjusted[0]}, " +
+                        f"{contrarian_adjusted[1]:.4f}→{low_value_adjusted[1]:.4f}")
+            else:
+                final_prediction = contrarian_adjusted
+        else:
             final_prediction = contrarian_adjusted
         
         # Get final trade decision and confidence
         final_class, final_prob = final_prediction
+        
+        # Adjust position sizing for low-value coins if the feature is enabled
+        current_price = await binance_client.get_latest_price(symbol)
+        is_low_value = current_price < config.LOW_VALUE_PRICE_THRESHOLD if current_price is not None else False
+        metadata['is_low_value_coin'] = is_low_value
+        
+        if is_low_value and config.LOW_VALUE_COIN_ENABLED and final_class == 1:
+            # Use specialized position sizing for low-value coins
+            position_percentage = config.LOW_VALUE_POSITION_PERCENTAGE
+            metadata['position_percentage'] = position_percentage
+            metadata['position_sizing'] = 'low_value_enhanced'
+            
+            log.info(f"{symbol} identified as a low-value coin (price: ${current_price:.4f}). " +
+                    f"Using enhanced position sizing: {position_percentage:.1%}")
+        else:
+            # Use standard position sizing
+            position_percentage = config.TRADE_CAPITAL_PERCENTAGE
+            metadata['position_percentage'] = position_percentage
+            metadata['position_sizing'] = 'standard'
         
         # Store the decision for later reference
         self.last_trade_decision[symbol] = {
