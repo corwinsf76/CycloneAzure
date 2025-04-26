@@ -1,182 +1,97 @@
-# /data_collection/binance_client.py
+# data_collection/binance_client.py
 
-import logging
-import datetime
-import pytz
-import pandas as pd
-import numpy as np
-from typing import List, Dict, Optional, Any
-import aiohttp
-import asyncio
-from tenacity import retry, stop_after_attempt, wait_exponential
+import os
+import time
+import hmac
+import hashlib
+import requests
 
-import config
-from database.db_utils import async_df_to_db
+# Load environment variables
+BASE_URL = "https://api.binance.us"
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_SECRET_KEY")
 
-log = logging.getLogger(__name__)
-
-# Binance API configuration - adjusted to use the TLD from config
-BINANCE_TLD = getattr(config, 'BINANCE_TLD', 'com')
-BINANCE_API_BASE = f"https://api.binance.{BINANCE_TLD}/api/v3"
-
-async def get_target_symbols() -> List[str]:
-    """Get list of USDT trading pairs from Binance."""
-    try:
-        headers = {}
-        # Add API key to headers if available
-        if hasattr(config, 'BINANCE_API_KEY') and config.BINANCE_API_KEY:
-            headers['X-MBX-APIKEY'] = config.BINANCE_API_KEY
-            
-        log.info(f"Using Binance API endpoint: {BINANCE_API_BASE}")
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{BINANCE_API_BASE}/exchangeInfo", headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    symbols = [
-                        symbol['symbol'] 
-                        for symbol in data['symbols']
-                        if symbol['quoteAsset'] == 'USDT' and symbol['status'] == 'TRADING'
-                    ]
-                    return sorted(symbols)
-                else:
-                    log.error(f"Error fetching exchange info: {response.status}, {await response.text()}")
-                    return []
-    except Exception as e:
-        log.error(f"Error getting target symbols: {e}")
-        return []
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-async def fetch_klines(
-    symbol: str,
-    interval: str = "5m",
-    limit: int = 1000,
-    start_str: Optional[str] = None,
-    end_str: Optional[str] = None
-) -> pd.DataFrame:
+def _get_signature(query_string):
     """
-    Fetch kline/candlestick data from Binance API.
-    Returns DataFrame with OHLCV data.
+    Generate HMAC SHA256 signature for Binance API.
     """
-    try:
-        params = {
-            'symbol': symbol,
-            'interval': interval,
-            'limit': limit
-        }
-        if start_str:
-            params['startTime'] = start_str
-        if end_str:
-            params['endTime'] = end_str
+    return hmac.new(API_SECRET.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
-        headers = {}
-        # Add API key to headers if available
-        if hasattr(config, 'BINANCE_API_KEY') and config.BINANCE_API_KEY:
-            headers['X-MBX-APIKEY'] = config.BINANCE_API_KEY
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{BINANCE_API_BASE}/klines", params=params, headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    
-                    df = pd.DataFrame(data, columns=[
-                        'open_time', 'open', 'high', 'low', 'close', 'volume',
-                        'close_time', 'quote_volume', 'trades', 'taker_buy_volume',
-                        'taker_buy_quote_volume', 'ignore'
-                    ])
-                    
-                    if df.empty:
-                        return pd.DataFrame()
-                    
-                    # Convert timestamps to datetime
-                    for col in ['open_time', 'close_time']:
-                        df[col] = pd.to_datetime(df[col], unit='ms', utc=True)
-                    
-                    # Convert string values to float
-                    for col in ['open', 'high', 'low', 'close', 'volume']:
-                        df[col] = df[col].astype(float)
-                    
-                    # Select only needed columns
-                    df = df[['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time']]
-                    
-                    return df
-                else:
-                    log.error(f"Error fetching klines for {symbol}: {response.status}, {await response.text()}")
-                    return pd.DataFrame()
-    except Exception as e:
-        log.error(f"Error fetching klines for {symbol}: {e}")
-        return pd.DataFrame()
-
-async def store_klines(symbol: str, interval: str, klines_df: pd.DataFrame) -> bool:
-    """Store klines data in the database."""
-    if klines_df.empty:
-        return False
-
-    try:
-        # Add symbol and interval columns
-        klines_df['symbol'] = symbol
-        klines_df['interval'] = interval
-
-        # Store in database using async function
-        success = await async_df_to_db(klines_df, 'price_data')
-        return success
-    except Exception as e:
-        log.error(f"Error storing klines for {symbol}: {e}")
-        return False
-
-async def fetch_and_store_recent_klines(symbol: str, interval: str = "5m", limit: int = 100) -> bool:
-    """Fetch and store recent klines for a symbol."""
-    klines_df = await fetch_klines(symbol=symbol, interval=interval, limit=limit)
-    if not klines_df.empty:
-        return await store_klines(symbol, interval, klines_df)
-    return False
-
-async def get_market_data(
-    symbol: str,
-    interval: str = "1h",
-    limit: int = 168,
-    start_time: Optional[datetime.datetime] = None,
-    end_time: Optional[datetime.datetime] = None
-) -> List[Dict[str, Any]]:
+def _send_request(http_method, endpoint, params=None, signed=False):
     """
-    Fetch market data for the dashboard.
-    Returns a list of dictionaries with OHLCV data.
+    Send HTTP request to Binance API.
     
     Args:
-        symbol: Trading pair symbol (e.g., 'BTCUSDT')
-        interval: Time interval (e.g., '1h', '4h', '1d')
-        limit: Number of candles to fetch
-        start_time: Start time for data fetch
-        end_time: End time for data fetch
-        
+        http_method (str): "GET" or "POST"
+        endpoint (str): API endpoint starting with "/"
+        params (dict): Query parameters
+        signed (bool): Whether the request requires signing
+    
     Returns:
-        List of dictionaries with OHLCV data
+        dict or list: API response
     """
-    try:
-        # Convert datetime objects to millisecond timestamps if provided
-        start_str = int(start_time.timestamp() * 1000) if start_time else None
-        end_str = int(end_time.timestamp() * 1000) if end_time else None
-        
-        # Fetch klines using existing function
-        df = await fetch_klines(
-            symbol=symbol,
-            interval=interval,
-            limit=limit,
-            start_str=start_str,
-            end_str=end_str
-        )
-        
-        if df.empty:
-            log.warning(f"No market data available for {symbol} with interval {interval}")
-            return []
-        
-        # Convert DataFrame to list of dictionaries for dashboard consumption
-        result = df.to_dict('records')
-        
-        log.info(f"Fetched {len(result)} {interval} candles for {symbol}")
-        return result
-        
-    except Exception as e:
-        log.error(f"Error fetching market data for {symbol}: {e}")
-        return []
+    if params is None:
+        params = {}
 
+    headers = {
+        "X-MBX-APIKEY": API_KEY
+    }
+
+    if signed:
+        params['timestamp'] = int(time.time() * 1000)
+        query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params)])
+        params['signature'] = _get_signature(query_string)
+
+    url = f"{BASE_URL}{endpoint}"
+
+    if http_method == "GET":
+        response = requests.get(url, headers=headers, params=params)
+    elif http_method == "POST":
+        response = requests.post(url, headers=headers, data=params)
+    else:
+        raise ValueError(f"Invalid HTTP method: {http_method}")
+
+    response.raise_for_status()
+    return response.json()
+
+def get_binance_klines(symbol, interval, start_time=None, end_time=None, limit=1000):
+    """
+    Fetch kline (candlestick) data for a given symbol and interval.
+
+    Args:
+        symbol (str): Trading pair symbol, e.g., "BTCUSDT"
+        interval (str): Kline interval, e.g., "1m", "5m", "1d"
+        start_time (int, optional): Start time in milliseconds
+        end_time (int, optional): End time in milliseconds
+        limit (int, optional): Number of klines to fetch (default 1000)
+
+    Returns:
+        list: List of klines
+    """
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
+    if start_time:
+        params["startTime"] = start_time
+    if end_time:
+        params["endTime"] = end_time
+
+    return _send_request("GET", "/api/v3/klines", params=params, signed=False)
+
+# Example future methods you could easily add:
+
+# def get_account_info():
+#     return _send_request("GET", "/api/v3/account", signed=True)
+
+# def create_order(symbol, side, type, quantity, price=None):
+#     params = {
+#         "symbol": symbol,
+#         "side": side,
+#         "type": type,
+#         "quantity": quantity
+#     }
+#     if price:
+#         params["price"] = price
+#     return _send_request("POST", "/api/v3/order", params=params, signed=True)

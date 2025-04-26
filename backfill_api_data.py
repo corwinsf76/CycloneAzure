@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-API Data Backfill Script - Now with async support
+One-Time DatabasAPI Data Backfill Script - Now with async support
 
 This script fetches and stores data from various cryptocurrency APIs
 using async patterns and PostgreSQL optimizations.
